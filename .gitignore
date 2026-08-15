@@ -1,0 +1,7 @@
+node_modules/
+.pipeline/state.json
+.pipeline/state.json.tmp
+.pipeline/pipeline.log
+.pipeline/logs/
+.pipeline/runner.lock
+.pipeline/control.json

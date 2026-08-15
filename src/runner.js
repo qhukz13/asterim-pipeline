@@ -1,0 +1,704 @@
+// The pipeline runner: a single deterministic loop.
+//
+//   ORCHESTRATOR -> tasks/current.md -> CODER -> reports/current.md
+//     -> TESTER -> test/report.md -> ORCHESTRATOR -> next task -> ...
+//
+// The loop is intentionally sequential: at most one agent runs at a time,
+// every step validates the protocol files it depends on, and anything
+// ambiguous stops the pipeline at a human gate instead of guessing.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { PIPELINE_DIR } from './config.js';
+import { AGENT_STATES, assertTransition } from './state-machine.js';
+import { parseTaskFile, parseCoderReport, parseTestReport, parseTestSpec, sha256 } from './parse.js';
+import { readState, writeState } from './store.js';
+import { FileWatcher } from './watch.js';
+import { runAgent, renderPrompt, pidAlive } from './agents.js';
+import { acquireLock, releaseLock, consumeControl } from './control.js';
+import * as gitx from './git.js';
+
+const SAFETY_TICK_MS = 5000;
+
+export class Runner extends EventEmitter {
+  /**
+   * @param {{root: string, config: import('./config.js').Config, logger: import('./logger.js').Logger}} opts
+   */
+  constructor({ root, config, logger }) {
+    super();
+    this.root = root;
+    this.cfg = config;
+    this.log = logger;
+    /** @type {import('./store.js').PersistedState} */
+    this.st = readState(root).state;
+    this.stopRequested = false;
+    this.resumeRequested = false;
+    this.runOnce = false;
+    /** @type {(() => void)|null} */
+    this.wakeResolve = null;
+    /** @type {AbortController|null} */
+    this.agentAbort = null;
+    /** @type {FileWatcher|null} */
+    this.watcher = null;
+    /** @type {fs.FSWatcher|null} */
+    this.ctrlWatcher = null;
+    /** @type {NodeJS.Timeout|null} */
+    this.tick = null;
+    /** exit summary for the CLI @type {{ok: boolean, gated: boolean, message: string}} */
+    this.exitInfo = { ok: true, gated: false, message: 'stopped' };
+  }
+
+  // ---------- protocol file access ----------
+
+  /** @param {'task'|'coderReport'|'testSpec'|'testReport'} key */
+  readProto(key) {
+    const abs = path.resolve(this.root, this.cfg.files[key]);
+    try {
+      const text = fs.readFileSync(abs, 'utf8');
+      return { text, hash: sha256(text) };
+    } catch {
+      return { text: null, hash: null };
+    }
+  }
+
+  save() {
+    writeState(this.root, this.st);
+  }
+
+  /** @param {import('./state-machine.js').PipelineState} to */
+  setState(to) {
+    const from = this.st.state;
+    assertTransition(from, to);
+    this.st.state = to;
+    this.save();
+    this.log.info(`state ${from} -> ${to}`);
+    this.emit('transition', { from, to });
+  }
+
+  // ---------- lifecycle ----------
+
+  /**
+   * @param {{once?: boolean}} [opts]
+   */
+  async start(opts = {}) {
+    this.runOnce = opts.once ?? false;
+    acquireLock(this.root);
+    try {
+      this.ensureDirs();
+      const { corrupt } = readState(this.root);
+      this.st = readState(this.root).state;
+      this.log.info(`pipeline starting (root=${this.root}${this.runOnce ? ', run-once' : ''})`);
+
+      this.watcher = new FileWatcher(
+        this.root,
+        Object.values(this.cfg.files),
+        this.cfg.watchDebounceMs,
+        (rel) => {
+          this.log.info(`file settled: ${rel}`);
+          this.wake();
+        },
+      );
+      this.watcher.start();
+      this.startControlChannel();
+      const onSigint = () => this.requestStop('SIGINT');
+      process.on('SIGINT', onSigint);
+
+      try {
+        if (corrupt) {
+          this.gate('State file .pipeline/state.json is corrupt or unreadable.', [
+            'The previous pipeline state could not be recovered safely.',
+            'Inspect the repository and delete .pipeline/state.json to start fresh.',
+          ]);
+        } else {
+          this.recover();
+        }
+        await this.runLoop();
+      } finally {
+        process.removeListener('SIGINT', onSigint);
+        this.watcher?.close();
+        this.ctrlWatcher?.close();
+        if (this.tick) clearInterval(this.tick);
+        this.save();
+      }
+      this.log.info('pipeline stopped');
+    } finally {
+      releaseLock(this.root);
+    }
+    return this.exitInfo;
+  }
+
+  ensureDirs() {
+    for (const rel of Object.values(this.cfg.files)) {
+      fs.mkdirSync(path.dirname(path.resolve(this.root, rel)), { recursive: true });
+    }
+    fs.mkdirSync(path.join(this.root, PIPELINE_DIR), { recursive: true });
+  }
+
+  startControlChannel() {
+    const dir = path.join(this.root, PIPELINE_DIR);
+    try {
+      this.ctrlWatcher = fs.watch(dir, (_e, filename) => {
+        if (filename && String(filename).toLowerCase() === 'control.json') this.processControl();
+      });
+      this.ctrlWatcher.on('error', () => {});
+    } catch {
+      /* safety tick still polls */
+    }
+    this.tick = setInterval(() => {
+      this.processControl();
+      this.wake();
+    }, SAFETY_TICK_MS);
+    // Don't let the safety tick keep the process alive on its own.
+    this.tick.unref?.();
+  }
+
+  processControl() {
+    const cmd = consumeControl(this.root);
+    if (!cmd) return;
+    this.log.info(`control command: ${cmd}`);
+    if (cmd === 'pause') {
+      this.st.paused = true;
+      this.save();
+    } else if (cmd === 'resume') {
+      this.st.paused = false;
+      this.resumeRequested = true;
+      this.save();
+    } else if (cmd === 'stop') {
+      this.requestStop('stop command');
+    }
+    this.wake();
+  }
+
+  /** @param {string} why */
+  requestStop(why) {
+    if (this.stopRequested) return;
+    this.stopRequested = true;
+    this.log.info(`stop requested (${why})`);
+    this.agentAbort?.abort();
+    this.wake();
+  }
+
+  wake() {
+    const r = this.wakeResolve;
+    this.wakeResolve = null;
+    r?.();
+  }
+
+  waitForWake() {
+    return new Promise((resolve) => {
+      this.wakeResolve = /** @type {() => void} */ (resolve);
+    });
+  }
+
+  // ---------- recovery ----------
+
+  recover() {
+    const s = this.st;
+    const agentRole = /** @type {Record<string, 'coder'|'tester'|'orchestrator'>} */ (AGENT_STATES)[s.state];
+    if (agentRole || s.interrupted) {
+      const role = agentRole ?? 'an agent';
+      const pid = agentRole ? s[`${agentRole}Pid`] : null;
+      if (pid != null && pidAlive(pid)) {
+        this.gate(`Previous ${role} process (pid ${pid}) appears to STILL be running.`, [
+          `The pipeline was restarted while task ${s.taskId ?? '?'} was in state ${s.state}.`,
+          'Wait for or terminate that process, verify the repository state, then resume.',
+        ]);
+      } else {
+        this.gate(`Pipeline previously stopped while ${role} was running (state ${s.state}).`, [
+          `Task ${s.taskId ?? '?'} may be half-finished. The task will NOT be restarted automatically.`,
+          'Review the repository and git state. Resuming will re-evaluate the protocol files',
+          `and may re-launch the ${role} for the same task.`,
+        ]);
+      }
+      s.interrupted = false;
+      s.coderPid = s.testerPid = s.orchestratorPid = null;
+      this.save();
+      return;
+    }
+    if (s.state === 'HUMAN_GATE' || s.state === 'FAILED') {
+      this.log.warn(`resuming in ${s.state}: ${s.gateReason ?? '(no reason recorded)'} — run "asterim-pipeline resume" after review`);
+      return;
+    }
+    if (s.state === 'BLOCKED') {
+      this.log.info('recovered in BLOCKED; orchestrator will be invoked');
+      return;
+    }
+    this.rescan(false);
+  }
+
+  /**
+   * Determine the pipeline state purely from protocol file contents.
+   * Used at first start and after a human "resume".
+   * @param {boolean} afterResume
+   */
+  rescan(afterResume) {
+    const s = this.st;
+    const taskF = this.readProto('task');
+    const task = parseTaskFile(taskF.text);
+    // Re-derivation from file contents, not a runtime transition: the state
+    // machine table does not apply here (e.g. a resume may land straight on
+    // TEST_REPORT_READY), so assign directly instead of using setState().
+    const set = (/** @type {import('./state-machine.js').PipelineState} */ to) => {
+      const from = s.state;
+      s.state = to;
+      this.save();
+      if (from !== to) {
+        this.log.info(`state ${from} -> ${to} (rescan)`);
+        this.emit('transition', { from, to });
+      }
+    };
+
+    if (!task.valid) {
+      this.log.info('no valid task in ' + this.cfg.files.task + '; waiting');
+      set('IDLE');
+      return;
+    }
+    if (task.phaseComplete) {
+      if (afterResume || taskF.hash === s.hashes.task) {
+        // Phase-complete already acknowledged; wait for a new task.
+        s.hashes.task = taskF.hash;
+        this.log.info('phase-complete acknowledged; waiting for next task');
+        set('IDLE');
+      } else {
+        s.hashes.task = taskF.hash;
+        this.phaseCompleteGate(task);
+      }
+      return;
+    }
+
+    s.hashes.task = taskF.hash;
+    if (task.taskId !== s.taskId) {
+      s.taskId = task.taskId;
+      s.phase = task.phase ?? s.phase;
+      s.startedAt = new Date().toISOString();
+      s.consecutiveBlocked = 0;
+    }
+
+    const repF = this.readProto('coderReport');
+    const rep = parseCoderReport(repF.text);
+    if (!rep.valid || rep.taskId !== task.taskId) {
+      set('TASK_READY');
+      return;
+    }
+    s.lastCoderStatus = rep.status;
+    s.hashes.coderReport = repF.hash;
+    if (rep.status === 'BLOCKED' || rep.status === 'FAILED') {
+      set('BLOCKED');
+      return;
+    }
+    const testF = this.readProto('testReport');
+    const test = parseTestReport(testF.text);
+    if (test.valid && test.taskId === task.taskId) {
+      s.lastTestResult = test.result;
+      s.hashes.testReport = testF.hash;
+      set('TEST_REPORT_READY');
+      return;
+    }
+    set('CODE_REPORT_READY');
+  }
+
+  // ---------- main loop ----------
+
+  async runLoop() {
+    while (!this.stopRequested) {
+      this.processControl();
+      if (this.stopRequested) break;
+      try {
+        const done = await this.stepOnce();
+        if (done) break;
+      } catch (err) {
+        this.gate(`Unexpected pipeline error: ${/** @type {Error} */ (err).message}`, [
+          'The pipeline cannot determine the next state safely.',
+        ]);
+      }
+    }
+  }
+
+  /**
+   * Execute one decision of the loop. Returns true when the loop should end.
+   * @returns {Promise<boolean>}
+   */
+  async stepOnce() {
+    const s = this.st;
+
+    if (s.state === 'HUMAN_GATE' || s.state === 'FAILED') {
+      if (this.resumeRequested) {
+        this.resumeRequested = false;
+        this.log.info('human resume received; re-evaluating protocol files');
+        s.gateReason = null;
+        this.rescan(true);
+        return false;
+      }
+      if (this.runOnce) {
+        this.exitInfo = { ok: false, gated: true, message: `human gate: ${s.gateReason ?? ''}` };
+        return true;
+      }
+      await this.waitForWake();
+      return false;
+    }
+
+    this.resumeRequested = false;
+
+    if (s.paused && s.state !== 'IDLE') {
+      // Finish nothing while paused; hold before launching the next agent.
+      if (this.runOnce) {
+        this.exitInfo = { ok: true, gated: false, message: 'pipeline is paused; run "asterim-pipeline resume" first' };
+        return true;
+      }
+      await this.waitForWake();
+      return false;
+    }
+
+    switch (s.state) {
+      case 'IDLE': {
+        const taskF = this.readProto('task');
+        if (taskF.hash != null && taskF.hash !== s.hashes.task) {
+          const task = parseTaskFile(taskF.text);
+          if (!task.valid) {
+            this.log.warn(`ignoring ${this.cfg.files.task}: ${task.problems.join('; ')}`);
+            s.hashes.task = taskF.hash;
+            this.save();
+          } else if (task.phaseComplete) {
+            s.hashes.task = taskF.hash;
+            this.phaseCompleteGate(task);
+            return false;
+          } else if (s.paused) {
+            if (this.runOnce) {
+              this.exitInfo = { ok: true, gated: false, message: 'pipeline is paused; run "asterim-pipeline resume" first' };
+              return true;
+            }
+            await this.waitForWake();
+            return false;
+          } else {
+            s.hashes.task = taskF.hash;
+            s.taskId = task.taskId;
+            s.phase = task.phase ?? s.phase;
+            s.startedAt = new Date().toISOString();
+            s.consecutiveBlocked = 0;
+            this.log.info(`new task detected: ${task.taskId}${task.phase ? ` (phase ${task.phase})` : ''}`);
+            this.setState('TASK_READY');
+          }
+          return false;
+        }
+        if (this.runOnce) {
+          this.exitInfo = { ok: true, gated: false, message: 'no new task; nothing to do' };
+          return true;
+        }
+        await this.waitForWake();
+        return false;
+      }
+      case 'TASK_READY':
+        await this.coderStep();
+        return false;
+      case 'CODE_REPORT_READY': {
+        const spec = parseTestSpec(this.readProto('testSpec').text);
+        const specUsable = spec.exists && (spec.taskId == null || spec.taskId === s.taskId);
+        if (specUsable) {
+          await this.testerStep();
+        } else if (this.cfg.skipTestingIfNoTestSpec) {
+          this.log.warn(
+            spec.exists
+              ? `test spec ${this.cfg.files.testSpec} is for task ${spec.taskId}, not ${s.taskId}; skipping TESTING`
+              : `no test spec at ${this.cfg.files.testSpec}; skipping TESTING`,
+          );
+          s.lastTestResult = 'SKIPPED';
+          await this.orchestratorStep('no tests were specified for this task');
+          return this.afterOrchestrationOnce();
+        } else {
+          this.gate(`Test spec ${this.cfg.files.testSpec} is missing or does not match task ${s.taskId}.`, [
+            'skipTestingIfNoTestSpec is disabled, so the pipeline will not continue without it.',
+          ]);
+        }
+        return false;
+      }
+      case 'TEST_REPORT_READY':
+        await this.orchestratorStep(
+          s.lastTestResult === 'FAIL' ? 'the required tests FAILED' : 'tests passed',
+        );
+        return this.afterOrchestrationOnce();
+      case 'BLOCKED':
+        await this.orchestratorStep(`the coder reported ${s.lastCoderStatus ?? 'BLOCKED'}`);
+        return this.afterOrchestrationOnce();
+      default:
+        // CODING/TESTING/ORCHESTRATING are transient inside steps; hitting one
+        // here means the in-memory state is inconsistent.
+        this.gate(`Pipeline reached inconsistent state ${s.state}.`, []);
+        return false;
+    }
+  }
+
+  afterOrchestrationOnce() {
+    if (!this.runOnce) return false;
+    const s = this.st;
+    if (s.state === 'TASK_READY' || s.state === 'IDLE') {
+      this.exitInfo = { ok: true, gated: false, message: `cycle complete; next state ${s.state}` };
+      return true;
+    }
+    return false; // gate states are handled at the top of stepOnce
+  }
+
+  // ---------- agent steps ----------
+
+  /**
+   * @param {'coder'|'tester'|'orchestrator'} role
+   * @param {string} prompt
+   * @returns {Promise<import('./agents.js').AgentResult>}
+   */
+  async launch(role, prompt) {
+    this.agentAbort = new AbortController();
+    const agentCfg = this.cfg.agents[role];
+    this.log.info(`launching ${role}: ${agentCfg.command} ${agentCfg.args.join(' ')}`);
+    const res = await runAgent(role, agentCfg, prompt, this.root, {
+      onSpawn: (pid) => {
+        this.st[`${role}Pid`] = pid;
+        this.save();
+        this.log.info(`${role} running (pid ${pid})`);
+      },
+      signal: this.agentAbort.signal,
+    });
+    this.agentAbort = null;
+    this.st[`${role}Pid`] = null;
+    this.log.info(
+      res.spawnError
+        ? `${role} failed to launch: ${res.spawnError}`
+        : `${role} exited code=${res.code}${res.timedOut ? ' (timed out)' : ''} log=${path.relative(this.root, res.logFile)}`,
+    );
+    return res;
+  }
+
+  /**
+   * Common post-exit checks. Returns true if the step must abort.
+   * @param {'coder'|'tester'|'orchestrator'} role
+   * @param {import('./agents.js').AgentResult} res
+   */
+  agentAborted(role, res) {
+    if (this.stopRequested) {
+      // Agent was killed (or died) while stopping: the task is not finished.
+      this.st.interrupted = true;
+      this.save();
+      this.log.warn(`${role} interrupted by stop; task ${this.st.taskId ?? '?'} left unfinished`);
+      return true;
+    }
+    if (res.spawnError) {
+      this.gate(`The ${role} could not be launched: ${res.spawnError}`, [
+        `Check the "${role}" command in .pipeline/config.json.`,
+      ]);
+      return true;
+    }
+    if (res.timedOut) {
+      this.gate(`The ${role} exceeded its ${this.cfg.agents[role].timeoutMinutes} minute timeout and was killed.`, [
+        `Task: ${this.st.taskId ?? '?'}`,
+      ]);
+      return true;
+    }
+    return false;
+  }
+
+  async coderStep() {
+    const s = this.st;
+    const task = parseTaskFile(this.readProto('task').text);
+    if (!task.valid || task.taskId !== s.taskId) {
+      this.gate(`Task file changed unexpectedly before the coder was launched (expected ${s.taskId}).`, []);
+      return;
+    }
+
+    const useGit = this.cfg.git.enabled && gitx.isRepo(this.root);
+    if (useGit && this.cfg.git.pullBeforeCycle) {
+      const pull = gitx.pullFfOnly(this.root);
+      if (!pull.ok) {
+        this.gate('git pull --ff-only failed before the coder cycle.', [pull.stderr || pull.stdout]);
+        return;
+      }
+    }
+    s.preCoderHeadSha = useGit ? gitx.headSha(this.root) : null;
+
+    this.setState('CODING');
+    const res = await this.launch('coder', renderPrompt(this.cfg.prompts.coder, { taskId: s.taskId ?? '' }));
+    if (this.agentAborted('coder', res)) return;
+
+    const repF = this.readProto('coderReport');
+    const rep = parseCoderReport(repF.text);
+    s.hashes.coderReport = repF.hash;
+    if (!rep.valid) {
+      this.gate(`Coder exited (code ${res.code}) but ${this.cfg.files.coderReport} is missing or malformed.`, rep.problems);
+      return;
+    }
+    if (rep.taskId !== s.taskId) {
+      this.gate(`Coder report is for task ${rep.taskId}, expected ${s.taskId}.`, []);
+      return;
+    }
+    s.lastCoderStatus = rep.status;
+
+    if (rep.status === 'BLOCKED' || rep.status === 'FAILED') {
+      s.consecutiveBlocked += 1;
+      this.log.warn(`coder reported ${rep.status} for task ${s.taskId} (${s.consecutiveBlocked} in a row)`);
+      if (s.consecutiveBlocked > this.cfg.maxConsecutiveBlocked) {
+        this.gate(`Coder reported ${rep.status} ${s.consecutiveBlocked} times in a row for this task.`, [
+          `Review ${this.cfg.files.coderReport}.`,
+        ]);
+      } else {
+        this.setState('BLOCKED');
+      }
+      return;
+    }
+
+    if (useGit && this.cfg.git.validateCoderCommit && task.expectCodeChanges) {
+      const head = gitx.headSha(this.root);
+      const committed = head !== s.preCoderHeadSha;
+      // Uncommitted pipeline bookkeeping (.pipeline/*) and the protocol files
+      // themselves do not count as evidence of code changes.
+      const ignorable = new Set(Object.values(this.cfg.files).map((p) => p.replace(/\\/g, '/')));
+      const codeChanges = gitx
+        .changedPaths(this.root)
+        .filter((p) => !p.startsWith(`${PIPELINE_DIR}/`) && p !== PIPELINE_DIR && !ignorable.has(p));
+      if (!committed && codeChanges.length === 0) {
+        this.gate(`Coder reported COMPLETE for ${s.taskId} but git shows no new commit and no code changes.`, [
+          'If this task genuinely changes no code, add "No-Code-Changes: true" to the task file.',
+        ]);
+        return;
+      }
+      if (!committed && codeChanges.length > 0) this.log.warn('coder left uncommitted changes and made no commit');
+      if (committed && this.cfg.git.pushAfterCommit) {
+        const p = gitx.push(this.root);
+        if (!p.ok) this.log.warn(`git push failed (continuing): ${p.stderr || p.stdout}`);
+      }
+    }
+
+    if (res.code !== 0) this.log.warn(`coder exit code ${res.code} but report is valid; continuing`);
+    s.tasksExecuted += 1;
+    this.setState('CODE_REPORT_READY');
+  }
+
+  async testerStep() {
+    const s = this.st;
+    this.setState('TESTING');
+    const res = await this.launch('tester', renderPrompt(this.cfg.prompts.tester, { taskId: s.taskId ?? '' }));
+    if (this.agentAborted('tester', res)) return;
+
+    const repF = this.readProto('testReport');
+    const rep = parseTestReport(repF.text);
+    s.hashes.testReport = repF.hash;
+    if (!rep.valid) {
+      this.gate(`Tester exited (code ${res.code}) but ${this.cfg.files.testReport} is missing or malformed.`, rep.problems);
+      return;
+    }
+    if (rep.taskId !== s.taskId) {
+      this.gate(`Test report is for task ${rep.taskId}, expected ${s.taskId}.`, []);
+      return;
+    }
+    s.lastTestResult = rep.result;
+    if (rep.result === 'PASS') {
+      s.consecutiveTestFailures = 0;
+      if (res.code !== 0) this.log.warn('test report says PASS but tester exit code was nonzero');
+    } else {
+      s.consecutiveTestFailures += 1;
+      this.log.warn(`tests FAILED for task ${s.taskId} (${s.consecutiveTestFailures} consecutive failure(s))`);
+      if (s.consecutiveTestFailures >= this.cfg.maxConsecutiveTestFailures) {
+        this.gate(`Tests have failed ${s.consecutiveTestFailures} times in a row.`, [
+          `Review ${this.cfg.files.testReport} and ${this.cfg.files.coderReport}.`,
+        ]);
+        return;
+      }
+    }
+    this.setState('TEST_REPORT_READY');
+  }
+
+  /**
+   * @param {string} trigger short human-readable reason shown to the orchestrator
+   */
+  async orchestratorStep(trigger) {
+    const s = this.st;
+    const before = this.readProto('task');
+    this.setState('ORCHESTRATING');
+    const prompt = renderPrompt(this.cfg.prompts.orchestrator, {
+      taskId: s.taskId ?? '',
+      trigger: ` — note: ${trigger}`,
+    });
+    const res = await this.launch('orchestrator', prompt);
+    if (this.agentAborted('orchestrator', res)) return;
+
+    const after = this.readProto('task');
+    if (after.hash == null || after.hash === before.hash) {
+      this.gate(`Orchestrator exited (code ${res.code}) without updating ${this.cfg.files.task}.`, [
+        'The pipeline cannot determine the next task.',
+      ]);
+      return;
+    }
+    const task = parseTaskFile(after.text);
+    s.hashes.task = after.hash;
+    if (!task.valid) {
+      this.gate(`Orchestrator wrote a malformed ${this.cfg.files.task}.`, task.problems);
+      return;
+    }
+    if (task.phaseComplete) {
+      this.phaseCompleteGate(task);
+      return;
+    }
+    if (task.taskId !== s.taskId) s.consecutiveBlocked = 0;
+    s.taskId = task.taskId;
+    s.phase = task.phase ?? s.phase;
+    s.startedAt = new Date().toISOString();
+    this.log.info(`orchestrator issued next task: ${task.taskId}`);
+    this.setState('TASK_READY');
+  }
+
+  // ---------- gates ----------
+
+  /**
+   * @param {string} reason
+   * @param {string[]} details
+   */
+  gate(reason, details = []) {
+    const s = this.st;
+    s.gateReason = reason;
+    s.coderPid = s.testerPid = s.orchestratorPid = null;
+    const from = s.state;
+    s.state = 'HUMAN_GATE';
+    this.save();
+    this.log.error(`HUMAN_GATE (from ${from}): ${reason}`);
+    this.log.banner([
+      'HUMAN REVIEW REQUIRED',
+      reason,
+      ...details,
+      'Review:',
+      `  ${this.cfg.files.coderReport}`,
+      `  ${this.cfg.files.testReport}`,
+      `  ${PIPELINE_DIR}/pipeline.log`,
+      'Pipeline is paused.',
+      'Run "asterim-pipeline resume" to continue after review.',
+    ]);
+    this.emit('gate', { reason, from });
+  }
+
+  /** @param {ReturnType<typeof parseTaskFile>} task */
+  phaseCompleteGate(task) {
+    const s = this.st;
+    const phase = task.phase ?? s.phase ?? '?';
+    if (!this.cfg.humanGateOnPhaseComplete) {
+      this.log.info(`phase ${phase} complete (humanGateOnPhaseComplete disabled); going IDLE`);
+      if (s.state !== 'IDLE') this.setState('IDLE');
+      return;
+    }
+    s.gateReason = `Phase ${phase} has completed.`;
+    s.coderPid = s.testerPid = s.orchestratorPid = null;
+    const from = s.state;
+    s.state = 'HUMAN_GATE';
+    this.save();
+    this.log.error(`HUMAN_GATE (from ${from}): phase ${phase} complete`);
+    this.log.banner([
+      'HUMAN REVIEW REQUIRED',
+      `Phase ${phase} has completed.`,
+      `Tasks executed: ${s.tasksExecuted}`,
+      `Last coder status: ${s.lastCoderStatus ?? 'n/a'}`,
+      `Last test result: ${s.lastTestResult ?? 'n/a'}`,
+      'Review:',
+      `  ${this.cfg.files.coderReport}`,
+      `  ${this.cfg.files.testReport}`,
+      'Pipeline is paused.',
+      `Have the orchestrator (or yourself) write the next ${this.cfg.files.task},`,
+      'then run "asterim-pipeline resume".',
+    ]);
+    this.emit('gate', { reason: s.gateReason, from });
+  }
+}
