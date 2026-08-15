@@ -15,7 +15,7 @@
 // used.
 
 import { MSG, makeMsg, capReport } from './proto.js';
-import { parseTaskFile } from './parse.js';
+import { parseTaskFile, sha256 } from './parse.js';
 import { runAgent, killTree } from './agents.js';
 import * as gitx from './git.js';
 import fs from 'node:fs';
@@ -308,6 +308,13 @@ export class Worker {
       }));
     }
 
+    // The report this run is expected to (re)write, as it stands beforehand.
+    const reportRel = role === 'coder' ? this.files.coderReport : this.files.testReport;
+    const reportAbs = path.resolve(this.root, reportRel);
+    const readReport = () => (fs.existsSync(reportAbs) ? fs.readFileSync(reportAbs, 'utf8') : null);
+    const beforeText = readReport();
+    const beforeHash = beforeText == null ? null : sha256(beforeText);
+
     const preSha = role === 'coder' ? gitx.headSha(this.root) : null;
     const res = await runAgent(role, this.agents[role], cmd.prompt, this.root, {
       onSpawn: (pid) => {
@@ -324,6 +331,26 @@ export class Worker {
         ? `[worker] [${role}] failed to launch: ${res.spawnError}`
         : `[worker] [${role}] exited code=${res.code}${res.timedOut ? ' (timed out)' : ''} log=${path.relative(this.root, res.logFile)}`,
     );
+
+    // Detect the classic headless failure here, on the machine that ran the
+    // agent, so the human gate can name the cause and the log to open
+    // instead of just reporting a stale report downstream.
+    const afterText = readReport();
+    const afterHash = afterText == null ? null : sha256(afterText);
+    if (afterHash == null || afterHash === beforeHash) {
+      const workerLog = path.relative(this.root, res.logFile);
+      const what = afterHash == null
+        ? `did not create ${reportRel}`
+        : `did not modify ${reportRel} (it still holds the previous content)`;
+      this.log.warn(`[worker] [${role}] ${what}`);
+      return makeMsg(MSG.ERROR, this.envelope({
+        dispatchId: cmd.dispatchId,
+        message:
+          `the ${role} exited (code ${res.code}) but ${what} in the worker clone at ${this.root}. ` +
+          'This usually means the agent was denied permission to write the file in headless mode. ' +
+          `Full agent output is on the worker at ${workerLog}.`,
+      }));
+    }
 
     let committed = false;
     let pushed = false;
@@ -346,9 +373,7 @@ export class Worker {
 
     // Only the protocol report file travels over the LAN — never source
     // code, transcripts, or environment data.
-    const reportRel = role === 'coder' ? this.files.coderReport : this.files.testReport;
-    const reportAbs = path.resolve(this.root, reportRel);
-    const reportContent = fs.existsSync(reportAbs) ? capReport(fs.readFileSync(reportAbs, 'utf8')) : null;
+    const reportContent = capReport(afterText);
 
     return makeMsg(role === 'coder' ? MSG.CODER_RESULT : MSG.TESTER_RESULT, this.envelope({
       dispatchId: cmd.dispatchId,

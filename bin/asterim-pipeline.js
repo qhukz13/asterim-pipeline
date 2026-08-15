@@ -13,6 +13,7 @@ import { Runner } from '../src/runner.js';
 import { getStatus } from '../src/status.js';
 import { readLiveLock, writeControl, acquireLock, releaseLock } from '../src/control.js';
 import { readState, writeState } from '../src/store.js';
+import { doctor, formatChecks } from '../src/doctor.js';
 import { OrchestratorServer } from '../src/server.js';
 import { RemoteExecutor } from '../src/remote.js';
 import { Worker } from '../src/worker.js';
@@ -25,6 +26,9 @@ local mode:
   start         run the pipeline loop in the foreground (Ctrl+C to stop)
   run-once      run a single task cycle, then exit
   status        show pipeline status (--json for machine-readable output)
+  doctor        preflight this machine: git, remote, agent commands on PATH;
+                add --probe to actually run the agents once and verify they
+                can write files headless (the usual cause of stalled runs)
   pause         finish the current agent, then hold before launching the next
   resume        clear pause, or acknowledge a HUMAN_GATE after review
   stop          stop the running pipeline (kills any running agent)
@@ -43,6 +47,7 @@ function parseArgs(argv) {
     command: '', root: process.cwd(), json: false,
     host: /** @type {string|null} */ (null), port: /** @type {number|null} */ (null),
     token: /** @type {string|null} */ (null), id: /** @type {string|null} */ (null),
+    probe: false,
   };
   const rest = [...argv];
   const take = (/** @type {string} */ flag) => {
@@ -54,6 +59,7 @@ function parseArgs(argv) {
     const a = /** @type {string} */ (rest.shift());
     if (a === '--root') args.root = path.resolve(take(a));
     else if (a === '--json') args.json = true;
+    else if (a === '--probe') args.probe = true;
     else if (a === '--host') args.host = take(a);
     else if (a === '--port') args.port = Number(take(a));
     else if (a === '--token') args.token = take(a);
@@ -320,6 +326,17 @@ async function main() {
       return workerCmd(args);
     case 'workers':
       return workersCmd(root, args.json);
+    case 'doctor': {
+      const config = loadConfig(root);
+      const logger = createLogger(config.projectRoot, { quiet: true });
+      const { checks, ok } = await doctor(config.projectRoot, config, {
+        roles: args.probe ? ['coder', 'tester'] : [],
+        logger,
+      });
+      console.log(formatChecks(checks));
+      if (!args.probe) console.log('\n(add --probe to verify the agents can write files headless)');
+      return ok ? 0 : 1;
+    }
     case 'status': {
       const st = getStatus(root);
       console.log(args.json ? JSON.stringify(st.json, null, 2) : st.text);

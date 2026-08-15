@@ -7,13 +7,17 @@ import { spawnSync } from 'node:child_process';
 /**
  * @param {string} cwd
  * @param {string[]} args
- * @returns {{ok: boolean, stdout: string, stderr: string}}
+ * @returns {{ok: boolean, stdout: string, stdoutRaw: string, stderr: string}}
  */
 export function git(cwd, args) {
   const res = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+  const stdoutRaw = res.stdout ?? '';
   return {
     ok: res.status === 0,
-    stdout: (res.stdout ?? '').trim(),
+    stdout: stdoutRaw.trim(),
+    // Untrimmed: column-sensitive output (e.g. `status --porcelain`, whose
+    // first two columns may be spaces) must not be trimmed before parsing.
+    stdoutRaw,
     stderr: (res.stderr ?? '').trim(),
   };
 }
@@ -46,8 +50,12 @@ export function changedPaths(cwd) {
   // directories, so protocol files can be filtered out precisely.
   const r = git(cwd, ['status', '--porcelain', '-uall']);
   if (!r.ok || r.stdout === '') return [];
-  return r.stdout
-    .split('\n')
+  // Parse the RAW output: porcelain status is column-based (`XY <path>`), so
+  // trimming would eat the leading space of an unstaged-modification line and
+  // shift its path by a character.
+  return r.stdoutRaw
+    .split(/\r?\n/)
+    .filter((line) => line.length > 3)
     .map((line) => {
       let p = line.slice(3).trim();
       const arrow = p.indexOf(' -> ');
