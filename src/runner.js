@@ -611,6 +611,10 @@ export class Runner extends EventEmitter {
       }
     }
     s.preCoderHeadSha = useGit ? gitx.headSha(this.root) : null;
+    // Remember the report as it stands BEFORE the run: if the agent cannot
+    // write it (denied permission, crash, wrong path), a stale report from a
+    // previous run must never be mistaken for this run's result.
+    const reportBefore = this.readProto('coderReport').hash;
 
     this.setState('CODING');
     const res = await this.launch('coder', renderPrompt(this.cfg.prompts.coder, { taskId: s.taskId ?? '' }));
@@ -629,6 +633,14 @@ export class Runner extends EventEmitter {
     const repF = this.readProto('coderReport');
     const rep = parseCoderReport(repF.text);
     s.hashes.coderReport = repF.hash;
+    if (repF.hash != null && repF.hash === reportBefore) {
+      this.gate(`Coder exited (code ${res.code}) but ${this.cfg.files.coderReport} was not modified — it still holds the previous run's content.`, [
+        'The agent most likely could not write the file (denied file-write permission in headless mode?).',
+        `Check the coder log under ${PIPELINE_DIR}/logs/ ${this.remote ? 'on the worker machine ' : ''}for a denial message,`,
+        'and make sure the agent is allowed to write the report file.',
+      ]);
+      return;
+    }
     if (!rep.valid) {
       this.gate(`Coder exited (code ${res.code}) but ${this.cfg.files.coderReport} is missing or malformed.`, rep.problems);
       return;
@@ -681,6 +693,7 @@ export class Runner extends EventEmitter {
 
   async testerStep() {
     const s = this.st;
+    const reportBefore = this.readProto('testReport').hash;
     this.setState('TESTING');
     const res = await this.launch('tester', renderPrompt(this.cfg.prompts.tester, { taskId: s.taskId ?? '' }));
     if (this.agentAborted('tester', res)) return;
@@ -696,6 +709,13 @@ export class Runner extends EventEmitter {
     const repF = this.readProto('testReport');
     const rep = parseTestReport(repF.text);
     s.hashes.testReport = repF.hash;
+    if (repF.hash != null && repF.hash === reportBefore) {
+      this.gate(`Tester exited (code ${res.code}) but ${this.cfg.files.testReport} was not modified — it still holds the previous run's content.`, [
+        'The agent most likely could not write the file (denied file-write permission in headless mode?).',
+        `Check the tester log under ${PIPELINE_DIR}/logs/ ${this.remote ? 'on the worker machine ' : ''}for a denial message.`,
+      ]);
+      return;
+    }
     if (!rep.valid) {
       this.gate(`Tester exited (code ${res.code}) but ${this.cfg.files.testReport} is missing or malformed.`, rep.problems);
       return;

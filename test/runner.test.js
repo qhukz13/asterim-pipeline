@@ -103,6 +103,61 @@ test('coder that exits without a report leads to HUMAN_GATE (exit code alone is 
   }
 });
 
+test('a stale report the coder could not overwrite is never accepted', async () => {
+  const root = makeRoot();
+  try {
+    // The real-world case: the previous task's report is still on disk and
+    // the coder cannot write the new one (headless file-write denied).
+    seedTask(root, 'T-2');
+    write(root, 'reports/current.md', 'Task-ID: T-1\nStatus: COMPLETE\n\nPrevious task, still on disk.\n');
+    const mute = fakeAgent(root, 'mute-coder', `bump('coder'); process.exit(0);`);
+    const r = makeRunner(root, { coder: mute, tester: normalTester(root, 'PASS') });
+    const info = await r.start({ once: true });
+    assert.equal(info.gated, true);
+    assert.equal(counter(root, 'coder'), 1, 'the coder does run for the new task');
+    assert.match(r.st.gateReason ?? '', /was not modified/);
+    assert.match(r.st.gateReason ?? '', /previous run/);
+    assert.equal(counter(root, 'tester'), 0, 'must not proceed to testing on a stale report');
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('a stale test report the tester could not overwrite is never accepted', async () => {
+  const root = makeRoot();
+  try {
+    seedTask(root, 'T-1');
+    write(root, 'test/report.md', 'Task-ID: T-1\nResult: PASS\n\nFrom an earlier run.\n');
+    const mute = fakeAgent(root, 'mute-tester', `bump('tester'); process.exit(0);`);
+    const r = makeRunner(root, { coder: normalCoder(root), tester: mute, orchestrator: normalOrchestrator(root) });
+    const info = await r.start({ once: true });
+    assert.equal(info.gated, true);
+    assert.match(r.st.gateReason ?? '', /was not modified/);
+    assert.equal(counter(root, 'orch'), 0, 'orchestrator must not review a stale test report');
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('the freshness check does not false-positive when the coder does write a new report', async () => {
+  const root = makeRoot();
+  try {
+    seedTask(root, 'T-2');
+    write(root, 'reports/current.md', 'Task-ID: T-1\nStatus: COMPLETE\n\nPrevious task, still on disk.\n');
+    const r = makeRunner(root, {
+      coder: normalCoder(root), // overwrites it with a T-2 report
+      tester: normalTester(root, 'PASS'),
+      orchestrator: normalOrchestrator(root),
+    });
+    const info = await r.start({ once: true });
+    assert.equal(info.gated, false, info.message);
+    assert.equal(r.st.lastCoderStatus, 'COMPLETE');
+    assert.equal(r.st.lastTestResult, 'PASS');
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
 test('coder report for the wrong task leads to HUMAN_GATE', async () => {
   const root = makeRoot();
   try {

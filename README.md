@@ -179,6 +179,52 @@ and the orchestrator not to modify implementation code.
   stdout/stderr (`coder-*` / `tester-*` / `orchestrator-*`), written on the
   machine where the agent actually ran.
 
+## Agent permissions (headless runs)
+
+The agents run **headless** (`claude -p`), so they cannot answer permission
+prompts: anything not pre-approved is denied, and the run ends with the agent
+explaining it "could not write the report". The pipeline detects this — if
+the report file is unchanged after a run it stops at a human gate saying the
+file *was not modified* rather than trusting a stale report — but you have to
+grant the permissions once for the cycle to work at all.
+
+Grant them in the **project repo being worked on** (Asterim), on whichever
+machine runs the agents (the laptop in distributed mode), in
+`.claude/settings.json`:
+
+```jsonc
+{
+  "permissions": {
+    "allow": [
+      "Read", "Glob", "Grep",
+      "Edit", "Write",                 // implementation + reports
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)",
+      "Bash(git diff:*)", "Bash(git log:*)",
+      "Bash(npm test:*)", "Bash(npm run:*)"
+    ]
+  }
+}
+```
+
+Trim the list to what your project actually needs. If a run still stalls,
+the agent log (`.pipeline/logs/coder-*.log`) names the exact tool call that
+was denied — add that one and re-run.
+
+Alternatives, in increasing order of bluntness:
+
+- Per-agent flags in `.pipeline/config.json`, e.g.
+  `"args": ["-p", "--permission-mode", "acceptEdits"]` — auto-accepts file
+  edits while still prompting for other tools (so pair it with `Bash(...)`
+  allow-rules for your verification commands).
+- `--dangerously-skip-permissions` bypasses all prompts. It removes a real
+  safety net; only consider it in a disposable/sandboxed clone, never on a
+  machine holding anything you would not want an automated agent to touch.
+
+The **tester** should get a narrower list than the coder (no `Edit`/`Write`
+to source, just the report file and the test commands) so the "tester must
+not modify production code" rule is enforced by permissions and not only by
+the prompt.
+
 ## Distributed mode (PC + laptop over LAN)
 
 Distributed mode splits the pipeline across two machines on the same local
