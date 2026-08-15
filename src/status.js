@@ -30,6 +30,7 @@ export function getStatus(root) {
   const agentLine = (pid, idleLabel) => (pid != null ? `running (pid ${pid})` : idleLabel);
 
   const lines = [
+    `Root:           ${root}${existed ? '' : '   <- no pipeline state here; wrong directory? (use --root)'}`,
     `Runner:         ${running ? `running (pid ${lock.pid}, since ${lock.startedAt})` : 'not running'}`,
     `State:          ${existed ? s.state : 'IDLE (no state yet)'}${s.paused ? ' [PAUSED]' : ''}`,
     `Phase:          ${s.phase ?? 'n/a'}`,
@@ -59,5 +60,5 @@ export function getStatus(root) {
   }
 
   lines.push(`Log:            ${PIPELINE_DIR}/pipeline.log`);
-  return { text: lines.join('\n'), json: { running, runnerPid: lock?.pid ?? null, workers, ...s } };
+  return { text: lines.join('\n'), json: { root, running, runnerPid: lock?.pid ?? null, workers, ...s } };
 }

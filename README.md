@@ -300,8 +300,25 @@ variables, no project memory.
 
 ```bash
 asterim-pipeline workers   # Worker ID / Status / Agent / Task / Last seen
-asterim-pipeline status    # includes a Worker: line in distributed mode
+asterim-pipeline status    # includes Root: and a Worker: line in distributed mode
 ```
+
+**Dashboard**: the orchestrator serves a read-only live dashboard at
+`http://127.0.0.1:<port>/dashboard` (URL printed at startup) — state, task,
+gate banner, worker table, and a live log tail, refreshing every 2 s. It is
+served **only to the orchestrator machine itself** (loopback), needs no
+token, and never contains agent transcripts. To view it from another machine,
+tunnel it: `ssh -L 4317:localhost:4317 <pc>`.
+
+**Watching Claude on the worker**: the worker streams the coder/tester
+stdout/stderr live into its own terminal (and always captures it to
+`.pipeline/logs/<role>-*.log` on the laptop). Transcripts never leave the
+machine that ran the agent. Note that `claude -p` prints its result when it
+finishes, so long silences during a run are normal.
+
+Note: `status`/`workers` read `.pipeline/` under the **current directory** —
+run them from the project root or pass `--root`; the `Root:` line shows which
+directory was actually inspected.
 
 ### remote.* configuration
 

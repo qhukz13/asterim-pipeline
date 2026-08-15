@@ -40,7 +40,9 @@ function winQuote(arg) {
  * @param {import('./config.js').AgentConfig} agentCfg
  * @param {string} prompt
  * @param {string} projectRoot
- * @param {{onSpawn?: (pid: number) => void, signal?: AbortSignal}} [hooks]
+ * @param {{onSpawn?: (pid: number) => void, signal?: AbortSignal,
+ *          onOutput?: (chunk: Buffer) => void}} [hooks] onOutput additionally
+ *          streams stdout/stderr chunks (they are always written to the log file)
  * @returns {Promise<AgentResult>}
  */
 export function runAgent(role, agentCfg, prompt, projectRoot, hooks = {}) {
@@ -112,6 +114,10 @@ export function runAgent(role, agentCfg, prompt, projectRoot, hooks = {}) {
 
       child.stdout.pipe(out, { end: false });
       child.stderr.pipe(out, { end: false });
+      if (hooks.onOutput) {
+        child.stdout.on('data', hooks.onOutput);
+        child.stderr.on('data', hooks.onOutput);
+      }
 
       child.on('close', (code) => {
         if (settled) return;

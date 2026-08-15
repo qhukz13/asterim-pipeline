@@ -11,20 +11,29 @@ export const DEFAULT_PROMPTS = {
     'Execute the current task ({taskId}).\n' +
     'Before reporting completion, independently review the git diff against every acceptance criterion and fix any issues.\n' +
     'Run all required verification.\n' +
-    'Write the final report to reports/current.md, including the lines "Task-ID: {taskId}" and "Status: COMPLETE" (or BLOCKED/FAILED).\n' +
+    'Write the final report to reports/current.md. The report MUST begin with these two exact plain-text lines ' +
+    '(no markdown bold, no emoji, no extra words on the line):\n' +
+    'Task-ID: {taskId}\n' +
+    'Status: COMPLETE\n' +
+    '(use Status: BLOCKED or Status: FAILED instead if you could not finish). The rest of the report is free-form.\n' +
     'Commit the completed work.',
   tester:
     'Read AGENTS.md, CLAUDE.md, tasks/current.md, reports/current.md, and test/current.md.\n' +
     'Execute ONLY the tests specified in test/current.md.\n' +
     'Do not modify production code.\n' +
-    'Write the complete verification result to test/report.md, including the lines "Task-ID: {taskId}" and "Result: PASS" (or FAIL).\n' +
+    'Write the complete verification result to test/report.md. The report MUST begin with these two exact plain-text lines ' +
+    '(no markdown bold, no emoji, no extra words on the line):\n' +
+    'Task-ID: {taskId}\n' +
+    'Result: PASS\n' +
+    '(use Result: FAIL instead if verification failed). The rest of the report is free-form.\n' +
     'Return the process exit status based on whether the required verification passed.',
   orchestrator:
     'Read AGENTS.md, CLAUDE.md, reports/current.md, and test/report.md.\n' +
     'Review the implementation and test results for task {taskId}{trigger}.\n' +
     'Decide the next task. Do not modify implementation code yourself.\n' +
-    'Write the next task to tasks/current.md, including a "Task-ID: <id>" line, an optional "Phase: <n>" line, ' +
-    'and if tests must be run for it, write test/current.md.\n' +
+    'Write the next task to tasks/current.md. It MUST contain an exact plain-text line "Task-ID: <id>" ' +
+    '(no markdown bold) and optionally "Phase: <n>"; if tests must be run for it, write test/current.md ' +
+    'with a matching "Task-ID: <id>" line.\n' +
     'If the current phase is complete, instead write "Status: PHASE_COMPLETE" to tasks/current.md.',
 };
 

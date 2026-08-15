@@ -55,6 +55,22 @@ test('parseTestReport recognizes PASS/FAIL via Result or Status', () => {
   assert.equal(parseTestReport(null).valid, false);
 });
 
+test('field parsing tolerates markdown decoration from real agents', () => {
+  // The exact failure seen in the wild: "**Status:** VERIFIED" etc.
+  const rep = parseCoderReport('# Report\n\n**Task-ID:** P6-06\n**Status:** VERIFIED\n\nAll criteria met.');
+  assert.deepEqual([rep.valid, rep.taskId, rep.status], [true, 'P6-06', 'COMPLETE']);
+  const rep2 = parseCoderReport('- **Task-ID**: P6-07\n- **Status**: **COMPLETE**\n');
+  assert.deepEqual([rep2.valid, rep2.taskId, rep2.status], [true, 'P6-07', 'COMPLETE']);
+  const t = parseTestReport('**Task-ID:** P6-06\n**Result:** ✅ PASS\n');
+  assert.deepEqual([t.valid, t.taskId, t.result], [true, 'P6-06', 'PASS']);
+  const t2 = parseTestReport('> Task-ID: P6-06\n> Result: _FAILED_\n');
+  assert.deepEqual([t2.valid, t2.result], [true, 'FAIL']);
+  const task = parseTaskFile('## Next task\n\n**Task-ID:** P7-01\n**Phase:** 7\n');
+  assert.deepEqual([task.valid, task.taskId, task.phase], [true, 'P7-01', '7']);
+  // plain style still works and garbage still fails
+  assert.equal(parseCoderReport('Task-ID: T-1\nStatus: nonsense\n').valid, false);
+});
+
 test('parseTestSpec', () => {
   assert.equal(parseTestSpec(null).exists, false);
   assert.equal(parseTestSpec('  \n').exists, false);

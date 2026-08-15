@@ -22,7 +22,8 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { PIPELINE_DIR } from './config.js';
-import { MSG, makeMsg, validateWorkerMessage, tokensEqual, isPrivateAddress } from './proto.js';
+import { MSG, makeMsg, validateWorkerMessage, tokensEqual, isPrivateAddress, isLoopbackAddress } from './proto.js';
+import { dashboardData, dashboardHtml } from './dashboard.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -174,6 +175,23 @@ export class OrchestratorServer extends EventEmitter {
     if (!this.cfg.allowPublicClients && !isPrivateAddress(addr)) {
       this.log.warn(`[orchestrator] rejected non-LAN client ${addr}`);
       this.respond(res, 403, { error: 'clients outside the local network are not allowed' });
+      return;
+    }
+    // Read-only dashboard: no token, but strictly loopback (the PC's own browser).
+    if (req.method === 'GET') {
+      if (!isLoopbackAddress(addr)) {
+        this.respond(res, 403, { error: 'dashboard is available on the orchestrator machine only' });
+        return;
+      }
+      if (req.url === '/dashboard' || req.url === '/dashboard/') {
+        const html = dashboardHtml();
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html) });
+        res.end(html);
+      } else if (req.url === '/dashboard/data') {
+        this.respond(res, 200, dashboardData(this.root));
+      } else {
+        this.respond(res, 404, { error: 'unknown endpoint' });
+      }
       return;
     }
     const auth = req.headers.authorization ?? '';

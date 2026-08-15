@@ -314,6 +314,9 @@ export class Worker {
         if (this.current) this.current.pid = pid;
         this.log.info(`[worker] [${role}] running (pid ${pid})`);
       },
+      // Stream the agent's output live to the worker terminal (it is also
+      // captured to .pipeline/logs/<role>-*.log). Stays on this machine.
+      onOutput: (chunk) => process.stdout.write(chunk),
     });
     if (this.current) this.current.pid = null;
     this.log.info(

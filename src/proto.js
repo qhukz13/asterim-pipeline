@@ -87,6 +87,18 @@ export function tokensEqual(a, b) {
 }
 
 /**
+ * Is this address the local machine itself? (Used to gate the read-only
+ * dashboard, which is served without a token to the PC's own browser only.)
+ * @param {string|undefined} addr
+ */
+export function isLoopbackAddress(addr) {
+  if (!addr) return false;
+  let a = addr;
+  if (a.startsWith('::ffff:')) a = a.slice(7);
+  return a === '::1' || a.startsWith('127.');
+}
+
+/**
  * Is this remote address on the local machine or a private LAN range?
  * Used to refuse connections that are not LAN-local (defense in depth on
  * top of token auth; can be disabled via remote.allowPublicClients).

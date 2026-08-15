@@ -234,7 +234,8 @@ async function orchestratorCmd(args) {
   ensurePipelineGitignore(root);
   const token = ensureOrchestratorToken(root);
   const server = new OrchestratorServer({ root, remoteCfg: config.remote, token, logger });
-  await server.listen();
+  const port = await server.listen();
+  console.log(`dashboard: http://127.0.0.1:${port}/dashboard`);
   const remote = new RemoteExecutor(server, { root, cfg: config, logger });
   const runner = new Runner({ root, config, logger, remote });
   try {

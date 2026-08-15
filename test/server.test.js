@@ -212,6 +212,32 @@ test('server: PAUSE is reported to a polling worker; queued STOP is delivered on
   }
 });
 
+test('server: dashboard is served to loopback without a token; POST endpoints still require it', async () => {
+  const root = makeRoot();
+  const { server, port } = await startServer(root);
+  try {
+    const page = await fetch(`http://127.0.0.1:${port}/dashboard`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get('content-type') ?? '', /text\/html/);
+    assert.match(await page.text(), /asterim-pipeline/);
+
+    const data = await fetch(`http://127.0.0.1:${port}/dashboard/data`);
+    assert.equal(data.status, 200);
+    const body = await data.json();
+    assert.equal(body.state.state, 'IDLE');
+    assert.ok(Array.isArray(body.workers));
+    assert.ok(Array.isArray(body.log));
+
+    assert.equal((await fetch(`http://127.0.0.1:${port}/nope`)).status, 404);
+    // command endpoints remain token-protected
+    const unauth = await fetch(`http://127.0.0.1:${port}/v1/register`, { method: 'POST', body: '{}' });
+    assert.equal(unauth.status, 401);
+  } finally {
+    server.close();
+    cleanupRoot(root);
+  }
+});
+
 test('server: heartbeats keep a worker online across the timeout window', async () => {
   const root = makeRoot();
   const { server, port } = await startServer(root);

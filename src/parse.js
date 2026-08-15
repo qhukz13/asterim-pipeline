@@ -27,14 +27,30 @@ export function sha256(text) {
 }
 
 /**
+ * Extract a labeled field. Tolerates the markdown decoration agents love to
+ * add: "**Task-ID:** P6-06", "- Status: COMPLETE", "> Result: **PASS**".
  * @param {string} text
  * @param {string} label e.g. "task[-_ ]?id"
  * @returns {string|null}
  */
 function field(text, label) {
-  const re = new RegExp(`^[ \\t>*-]*${label}[ \\t]*[:=][ \\t]*(.+?)[ \\t]*$`, 'im');
+  const re = new RegExp(
+    `^[ \\t>*_\\-#]*${label}[ \\t]*\\*{0,2}_{0,2}[ \\t]*[:=][ \\t]*\\*{0,2}_{0,2}[ \\t]*(.+?)[ \\t]*[*_]*[ \\t]*$`,
+    'im',
+  );
   const m = re.exec(text);
   return m ? m[1].trim() : null;
+}
+
+/**
+ * Normalize a status-ish value: drop markdown emphasis and any leading
+ * emoji/symbols ("✅ PASS" -> "PASS").
+ * @param {string|null} value
+ */
+function cleanStatusValue(value) {
+  if (value == null) return null;
+  const v = value.replace(/[*_`]/g, '').replace(/^[^A-Za-z0-9]+/, '').trim();
+  return v === '' ? null : v;
 }
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._\-\/]*$/;
@@ -79,6 +95,7 @@ const CODER_STATUS = {
   completed: 'COMPLETE',
   done: 'COMPLETE',
   success: 'COMPLETE',
+  verified: 'COMPLETE',
   blocked: 'BLOCKED',
   failed: 'FAILED',
   fail: 'FAILED',
@@ -95,7 +112,7 @@ export function parseCoderReport(text) {
   }
   const taskId = extractTaskId(text);
   if (taskId == null) problems.push('no Task-ID found in coder report');
-  const raw = field(text, 'status');
+  const raw = cleanStatusValue(field(text, 'status'));
   const status = raw != null ? (CODER_STATUS[raw.toLowerCase()] ?? null) : null;
   if (status == null) problems.push(raw == null ? 'no Status field found in coder report' : `unrecognized coder status "${raw}"`);
   return { valid: taskId != null && status != null, taskId, status, problems };
@@ -112,7 +129,7 @@ export function parseTestReport(text) {
   }
   const taskId = extractTaskId(text);
   if (taskId == null) problems.push('no Task-ID found in test report');
-  const raw = field(text, '(?:result|status)');
+  const raw = cleanStatusValue(field(text, '(?:result|status)'));
   /** @type {'PASS'|'FAIL'|null} */
   let result = null;
   if (raw != null) {
