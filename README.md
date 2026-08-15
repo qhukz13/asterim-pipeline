@@ -53,9 +53,13 @@ terminal.
 | `pause` | finish the current agent, then hold before launching the next |
 | `resume` | clear a pause, or acknowledge a HUMAN_GATE after review |
 | `stop` | stop the running pipeline (kills any running agent) |
+| `orchestrator` | distributed mode: run the pipeline, dispatching coder/tester to a LAN worker |
+| `worker` | distributed mode: run as an execution node (`--host`, `--port`, `--token`, `--id`) |
+| `workers` | show registered workers and their status |
 
 All commands accept `--root <dir>` (default: current directory, or
-`ASTERIM_PIPELINE_ROOT`).
+`ASTERIM_PIPELINE_ROOT`). See "Distributed mode" below for the
+orchestrator/worker/workers commands.
 
 Exit codes: `0` ok · `1` error · `3` run-once ended at a human gate.
 
@@ -169,9 +173,149 @@ and the orchestrator not to modify implementation code.
 ## Logs
 
 - `.pipeline/pipeline.log` — state transitions, launches, exits, validation
-  results, gates.
+  results, gates. Lines are tagged `[orchestrator]` / `[worker]` in
+  distributed mode; agent activity is tagged per role.
 - `.pipeline/logs/<agent>-<timestamp>.log` — each agent's captured
-  stdout/stderr.
+  stdout/stderr (`coder-*` / `tester-*` / `orchestrator-*`), written on the
+  machine where the agent actually ran.
+
+## Distributed mode (PC + laptop over LAN)
+
+Distributed mode splits the pipeline across two machines on the same local
+network. **Git remains the repository synchronization mechanism** — the LAN
+protocol transports only pipeline commands, task metadata, execution status,
+and the two protocol report files. Never source code, transcripts, API keys,
+or environment variables.
+
+```
+PC:      asterim-pipeline orchestrator   (authoritative state + Antigravity)
+              │  HTTP over LAN (Bearer token, long-poll)
+laptop:  asterim-pipeline worker         (runs Claude coder + tester)
+```
+
+### Setup
+
+Both machines need their own **clone of the same git remote**, each with a
+branch tracking the remote (`git push -u origin main`).
+
+**PC (orchestrator):**
+
+```bash
+asterim-pipeline orchestrator
+```
+
+On first run this generates the shared worker token at
+`.pipeline/orchestrator.token` (git-ignored). Copy its *value* to the laptop.
+
+**Laptop (worker):** put the token in `.pipeline/worker.token` (git-ignored),
+or `ASTERIM_PIPELINE_TOKEN`, or pass `--token`. Then:
+
+```bash
+asterim-pipeline worker --host <PC-LAN-IP> --port 4317
+```
+
+Connection settings can also live in `.pipeline/worker.json`
+(`{"host": "192.168.1.10", "port": 4317, "workerId": "laptop-01"}`) —
+**never put the token in worker.json**; it may be committed. The laptop's
+own `.pipeline/config.json` supplies the local `claude` commands for coder
+and tester; prompts come from the orchestrator with each dispatch.
+
+To find the PC's LAN address: `ipconfig` (Windows), `ip addr` (Linux),
+`ipconfig getifaddr en0` (macOS) — use the RFC1918 address (typically
+`192.168.x.x` or `10.x.x.x`).
+
+### Execution flow
+
+1. Orchestrator commits & pushes `tasks/current.md` + `test/current.md`
+   (additive, scoped to those files; `remote.autoCommitTaskFiles: false`
+   requires you/Antigravity to commit them instead).
+2. `RUN_CODER` is dispatched. Worker: `git pull --ff-only` → run coder →
+   coder commits → worker `git push` (plain, never force).
+3. `CODER_RESULT` returns metadata + the report content; the orchestrator
+   pulls and validates with the exact same rules as local mode.
+4. `RUN_TESTER`: worker pulls, runs only `test/current.md`, returns the
+   `test/report.md` content in `TESTER_RESULT` (the tester commits nothing).
+5. Antigravity (the orchestrator agent) runs locally on the PC as usual.
+
+A non-fast-forward pull or rejected push on the worker produces
+`WORKER_GIT_CONFLICT` and the pipeline enters a human gate. No destructive
+git command (`reset --hard`, `clean`, `push --force`) is ever run anywhere.
+
+### Liveness, idempotency, recovery
+
+- Worker heartbeats every `remote.heartbeatIntervalMs` (10 s); the
+  orchestrator declares it offline after `remote.heartbeatTimeoutMs` (30 s).
+- Worker loss while a task runs → `RUNNING TASK → WORKER OFFLINE →
+  HUMAN_GATE`. Interrupted Claude processes are **never** auto-restarted;
+  after the worker reconnects, review and run `asterim-pipeline resume` —
+  the pipeline pulls and re-derives the safe recovery point from the
+  protocol files.
+- Commands are delivered at-least-once (re-offered every
+  `remote.redeliverMs` until acknowledged by a result); the worker
+  deduplicates by `dispatchId`, so a duplicated `RUN_CODER` can never launch
+  two coders. Results are queued on the worker and retried across
+  reconnects.
+- The worker keeps no pipeline state; the orchestrator's
+  `.pipeline/state.json` remains the single authority, and all local-mode
+  human gates and crash recovery behavior apply unchanged.
+
+### Network boundary
+
+- The **orchestrator** listens on `remote.bind` (default `0.0.0.0`) at
+  `remote.port` (default `4317`). Bind to a specific LAN interface address
+  to narrow exposure. The worker listens on nothing; it only dials out to
+  the configured orchestrator.
+- Requests from non-private addresses (outside loopback, RFC1918,
+  link-local, fc00::/7) are rejected regardless of token, unless
+  `remote.allowPublicClients` is explicitly enabled. Do not expose the port
+  publicly; do not port-forward it.
+- Every request requires the shared token (constant-time comparison);
+  malformed protocol messages are rejected and logged.
+- Firewall: allow **inbound TCP `4317` from your LAN subnet only** on the
+  PC. Windows: `New-NetFirewallRule -DisplayName asterim-pipeline -Direction
+  Inbound -Protocol TCP -LocalPort 4317 -RemoteAddress 192.168.1.0/24
+  -Action Allow`. Linux: `ufw allow from 192.168.1.0/24 to any port 4317
+  proto tcp`. macOS: allow the node binary in System Settings → Network →
+  Firewall. The laptop needs no inbound rule.
+- Traffic is plain HTTP on your LAN. The payload is deliberately
+  non-sensitive (see below); if your LAN is untrusted, tunnel it (e.g. SSH
+  port-forward `ssh -L 4317:localhost:4317 pc`) — the pipeline itself makes
+  no outbound cloud connections.
+
+### Exactly what travels over the LAN
+
+| direction | message | contents |
+|---|---|---|
+| worker → PC | `WORKER_REGISTER`, `WORKER_HEARTBEAT`, `WORKER_POLL` | worker id, session id, current agent role, current task id |
+| PC → worker | `RUN_CODER`, `RUN_TESTER` | dispatch id, task id, the rendered prompt text |
+| PC → worker | `PAUSE`, `STOP`, `NONE` | control signals, no payload |
+| worker → PC | `CODER_RESULT`, `TESTER_RESULT` | dispatch/task id, exit code, timed-out flag, committed/pushed flags, and the content of `reports/current.md` / `test/report.md` (capped at 256 KiB) |
+| worker → PC | `WORKER_GIT_CONFLICT`, `ERROR` | stage (pull/push) and the git/agent error text |
+
+Nothing else: no source code (that moves through git), no agent transcripts
+(they stay in the worker's `.pipeline/logs/`), no API keys, no environment
+variables, no project memory.
+
+### Observability
+
+```bash
+asterim-pipeline workers   # Worker ID / Status / Agent / Task / Last seen
+asterim-pipeline status    # includes a Worker: line in distributed mode
+```
+
+### remote.* configuration
+
+| key | default | meaning |
+|---|---|---|
+| `bind` | `0.0.0.0` | orchestrator listen address |
+| `port` | `4317` | orchestrator listen port |
+| `heartbeatIntervalMs` | `10000` | worker heartbeat cadence (server-assigned) |
+| `heartbeatTimeoutMs` | `30000` | worker declared offline after this silence |
+| `pollTimeoutMs` | `25000` | long-poll hold time |
+| `redeliverMs` | `5000` | unacknowledged command re-offer interval |
+| `dispatchGraceMinutes` | `5` | added to the agent timeout for the dispatch timeout |
+| `allowPublicClients` | `false` | accept non-LAN client addresses (leave off) |
+| `autoCommitTaskFiles` | `true` | pipeline commits+pushes the task files before dispatch |
 
 ## Development
 

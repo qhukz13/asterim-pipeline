@@ -7,9 +7,9 @@ import path from 'node:path';
 import { PIPELINE_DIR } from './config.js';
 import { pidAlive } from './agents.js';
 
-/** @param {string} root */
-export function lockPath(root) {
-  return path.join(root, PIPELINE_DIR, 'runner.lock');
+/** @param {string} root @param {string} [name] */
+export function lockPath(root, name = 'runner') {
+  return path.join(root, PIPELINE_DIR, `${name}.lock`);
 }
 
 /** @param {string} root */
@@ -19,10 +19,11 @@ export function controlPath(root) {
 
 /**
  * @param {string} root
+ * @param {string} [name]
  * @returns {{pid: number, startedAt: string}|null} live lock info, or null
  */
-export function readLiveLock(root) {
-  const file = lockPath(root);
+export function readLiveLock(root, name = 'runner') {
+  const file = lockPath(root, name);
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (typeof raw?.pid === 'number' && pidAlive(raw.pid)) return raw;
@@ -33,22 +34,23 @@ export function readLiveLock(root) {
 }
 
 /**
- * Acquire the runner lock. Throws if another live runner holds it; silently
+ * Acquire a process lock. Throws if another live process holds it; silently
  * replaces a stale lock (dead PID).
  * @param {string} root
+ * @param {string} [name]
  */
-export function acquireLock(root) {
-  const live = readLiveLock(root);
-  if (live) throw new Error(`pipeline already running (pid ${live.pid}, started ${live.startedAt})`);
-  fs.mkdirSync(path.dirname(lockPath(root)), { recursive: true });
-  fs.writeFileSync(lockPath(root), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\n', 'utf8');
+export function acquireLock(root, name = 'runner') {
+  const live = readLiveLock(root, name);
+  if (live) throw new Error(`${name} already running (pid ${live.pid}, started ${live.startedAt})`);
+  fs.mkdirSync(path.dirname(lockPath(root, name)), { recursive: true });
+  fs.writeFileSync(lockPath(root, name), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\n', 'utf8');
 }
 
-/** @param {string} root */
-export function releaseLock(root) {
+/** @param {string} root @param {string} [name] */
+export function releaseLock(root, name = 'runner') {
   try {
-    const raw = JSON.parse(fs.readFileSync(lockPath(root), 'utf8'));
-    if (raw?.pid === process.pid) fs.unlinkSync(lockPath(root));
+    const raw = JSON.parse(fs.readFileSync(lockPath(root, name), 'utf8'));
+    if (raw?.pid === process.pid) fs.unlinkSync(lockPath(root, name));
   } catch {
     /* nothing to release */
   }

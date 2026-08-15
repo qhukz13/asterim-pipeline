@@ -47,6 +47,9 @@ export const DEFAULT_FILES = {
  *   skipTestingIfNoTestSpec: boolean,
  *   agents: {coder: AgentConfig, tester: AgentConfig, orchestrator: AgentConfig},
  *   git: {enabled: boolean, validateCoderCommit: boolean, pullBeforeCycle: boolean, pushAfterCommit: boolean},
+ *   remote: {bind: string, port: number, heartbeatIntervalMs: number, heartbeatTimeoutMs: number,
+ *            pollTimeoutMs: number, redeliverMs: number, dispatchGraceMinutes: number,
+ *            allowPublicClients: boolean, autoCommitTaskFiles: boolean},
  *   prompts: {coder: string, tester: string, orchestrator: string},
  *   files: {task: string, coderReport: string, testSpec: string, testReport: string},
  * }} Config
@@ -80,6 +83,17 @@ export function defaultConfig(projectRoot) {
       orchestrator: agentDefaults('agy', { args: [], timeoutMinutes: 30 }),
     },
     git: { enabled: true, validateCoderCommit: true, pullBeforeCycle: false, pushAfterCommit: false },
+    remote: {
+      bind: '0.0.0.0', // LAN-reachable; protect with firewall rules + token (see README)
+      port: 4317,
+      heartbeatIntervalMs: 10000,
+      heartbeatTimeoutMs: 30000,
+      pollTimeoutMs: 25000,
+      redeliverMs: 5000, // how often an unacknowledged command is re-offered to the worker
+      dispatchGraceMinutes: 5, // added to the agent timeout for the orchestrator-side dispatch timeout
+      allowPublicClients: false,
+      autoCommitTaskFiles: true, // commit+push tasks/current.md & test/current.md before dispatching
+    },
     prompts: { ...DEFAULT_PROMPTS },
     files: { ...DEFAULT_FILES },
   };
@@ -122,6 +136,17 @@ export function mergeConfig(projectRoot, raw) {
   if (raw.git && typeof raw.git === 'object') {
     for (const key of /** @type {const} */ (['enabled', 'validateCoderCommit', 'pullBeforeCycle', 'pushAfterCommit'])) {
       if (typeof raw.git[key] === 'boolean') cfg.git[key] = raw.git[key];
+    }
+  }
+  if (raw.remote && typeof raw.remote === 'object') {
+    if (typeof raw.remote.bind === 'string' && raw.remote.bind.trim() !== '') cfg.remote.bind = raw.remote.bind;
+    for (const key of /** @type {const} */ ([
+      'port', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'pollTimeoutMs', 'redeliverMs', 'dispatchGraceMinutes',
+    ])) {
+      if (typeof raw.remote[key] === 'number' && raw.remote[key] >= 0) cfg.remote[key] = raw.remote[key];
+    }
+    for (const key of /** @type {const} */ (['allowPublicClients', 'autoCommitTaskFiles'])) {
+      if (typeof raw.remote[key] === 'boolean') cfg.remote[key] = raw.remote[key];
     }
   }
   if (raw.files && typeof raw.files === 'object') {

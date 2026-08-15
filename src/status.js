@@ -1,5 +1,7 @@
 // "asterim-pipeline status" — read-only view of state.json + runner lock.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { readState } from './store.js';
 import { readLiveLock } from './control.js';
 import { PIPELINE_DIR } from './config.js';
@@ -38,6 +40,24 @@ export function getStatus(root) {
     `Tasks executed: ${s.tasksExecuted}`,
   ];
   if (s.gateReason) lines.push(`Gate reason:    ${s.gateReason}`);
+
+  // Distributed mode: show the worker(s) last persisted by the orchestrator.
+  /** @type {any[]} */
+  let workers = [];
+  try {
+    const wf = path.join(root, PIPELINE_DIR, 'workers.json');
+    if (fs.existsSync(wf)) workers = JSON.parse(fs.readFileSync(wf, 'utf8')).workers ?? [];
+  } catch {
+    /* observability only */
+  }
+  for (const w of workers) {
+    lines.push(
+      `Worker:         ${w.workerId} ${w.online ? 'ONLINE' : 'OFFLINE'}` +
+        `${w.currentAgent ? `, running ${w.currentAgent}` : ''}${w.taskId ? ` (task ${w.taskId})` : ''}` +
+        ` — last seen ${ago(w.lastSeenAt ?? null)}`,
+    );
+  }
+
   lines.push(`Log:            ${PIPELINE_DIR}/pipeline.log`);
-  return { text: lines.join('\n'), json: { running, runnerPid: lock?.pid ?? null, ...s } };
+  return { text: lines.join('\n'), json: { running, runnerPid: lock?.pid ?? null, workers, ...s } };
 }

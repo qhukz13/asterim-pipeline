@@ -153,3 +153,61 @@ export { createLogger } from '../src/logger.js';
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/** @param {() => boolean} cond @param {number} [timeoutMs] */
+export async function waitFor(cond, timeoutMs = 8000) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
+    await sleep(25);
+  }
+}
+
+/** Run git in a directory, asserting success. @param {string} cwd @param {string[]} args */
+export function gitRun(cwd, args) {
+  const { spawnSync } = /** @type {typeof import('node:child_process')} */ (require_child());
+  const res = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true });
+  if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`);
+  return (res.stdout ?? '').trim();
+}
+
+// Lazy import shim so plain-ESM helpers keep working under node:test.
+import { createRequire } from 'node:module';
+const require_ = createRequire(import.meta.url);
+function require_child() {
+  return require_('node:child_process');
+}
+
+/**
+ * Distributed-mode fixture: a bare origin plus two clones sharing it.
+ * Both clones get git user config and the protocol/pipeline directories.
+ * @returns {{origin: string, orchRoot: string, workerRoot: string, cleanup: () => void}}
+ */
+export function makeGitPair() {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'asterim-dist-'));
+  const origin = path.join(base, 'origin.git');
+  const orchRoot = path.join(base, 'orch');
+  const workerRoot = path.join(base, 'worker');
+  fs.mkdirSync(origin, { recursive: true });
+  gitRun(origin, ['init', '--bare', '-q', '-b', 'main']);
+  gitRun(base, ['clone', '-q', origin, orchRoot]);
+  gitRun(orchRoot, ['config', 'user.email', 'test@example.com']);
+  gitRun(orchRoot, ['config', 'user.name', 'Test']);
+  gitRun(orchRoot, ['checkout', '-q', '-b', 'main']);
+  for (const d of ['tasks', 'reports', 'test', '.pipeline']) fs.mkdirSync(path.join(orchRoot, d), { recursive: true });
+  fs.writeFileSync(path.join(orchRoot, 'README.md'), 'seed\n', 'utf8');
+  fs.writeFileSync(path.join(orchRoot, '.gitignore'), '.pipeline/\n.counters-*\n*.cjs\n.orch-prompt-*\n', 'utf8');
+  gitRun(orchRoot, ['add', '-A']);
+  gitRun(orchRoot, ['commit', '-q', '-m', 'seed']);
+  gitRun(orchRoot, ['push', '-q', '-u', 'origin', 'main']);
+  gitRun(base, ['clone', '-q', origin, workerRoot]);
+  gitRun(workerRoot, ['config', 'user.email', 'worker@example.com']);
+  gitRun(workerRoot, ['config', 'user.name', 'Worker']);
+  for (const d of ['tasks', 'reports', 'test', '.pipeline']) fs.mkdirSync(path.join(workerRoot, d), { recursive: true });
+  return {
+    origin,
+    orchRoot,
+    workerRoot,
+    cleanup: () => cleanupRoot(base),
+  };
+}

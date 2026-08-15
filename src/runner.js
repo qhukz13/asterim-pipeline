@@ -23,13 +23,17 @@ const SAFETY_TICK_MS = 5000;
 
 export class Runner extends EventEmitter {
   /**
-   * @param {{root: string, config: import('./config.js').Config, logger: import('./logger.js').Logger}} opts
+   * @param {{root: string, config: import('./config.js').Config, logger: import('./logger.js').Logger,
+   *          remote?: import('./remote.js').RemoteExecutor|null}} opts
    */
-  constructor({ root, config, logger }) {
+  constructor({ root, config, logger, remote = null }) {
     super();
     this.root = root;
     this.cfg = config;
     this.log = logger;
+    /** When set, coder/tester execution is dispatched to the LAN worker. */
+    this.remote = remote;
+    this.waitingForWorkerLogged = false;
     /** @type {import('./store.js').PersistedState} */
     this.st = readState(root).state;
     this.stopRequested = false;
@@ -101,6 +105,8 @@ export class Runner extends EventEmitter {
       );
       this.watcher.start();
       this.startControlChannel();
+      this.remote?.onStateChange(() => this.wake());
+      this.remote?.setPaused(this.st.paused);
       const onSigint = () => this.requestStop('SIGINT');
       process.on('SIGINT', onSigint);
 
@@ -160,10 +166,12 @@ export class Runner extends EventEmitter {
     if (cmd === 'pause') {
       this.st.paused = true;
       this.save();
+      this.remote?.setPaused(true);
     } else if (cmd === 'resume') {
       this.st.paused = false;
       this.resumeRequested = true;
       this.save();
+      this.remote?.setPaused(false);
     } else if (cmd === 'stop') {
       this.requestStop('stop command');
     }
@@ -234,6 +242,18 @@ export class Runner extends EventEmitter {
    */
   rescan(afterResume) {
     const s = this.st;
+    if (this.remote && this.cfg.git.enabled && gitx.isRepo(this.root)) {
+      // In distributed mode the worker may have pushed work while we were
+      // down or gated; the protocol files are only trustworthy after a pull.
+      const pull = gitx.pullFfOnly(this.root);
+      if (!pull.ok) {
+        this.gate('git pull --ff-only failed while re-evaluating the pipeline state.', [
+          (pull.stderr || pull.stdout).slice(0, 500),
+          'Resolve the git state manually, then run "asterim-pipeline resume".',
+        ]);
+        return;
+      }
+    }
     const taskF = this.readProto('task');
     const task = parseTaskFile(taskF.text);
     // Re-derivation from file contents, not a runtime transition: the state
@@ -388,13 +408,18 @@ export class Runner extends EventEmitter {
         await this.waitForWake();
         return false;
       }
-      case 'TASK_READY':
+      case 'TASK_READY': {
+        const wait = await this.waitForWorkerIfOffline();
+        if (wait !== null) return wait;
         await this.coderStep();
         return false;
+      }
       case 'CODE_REPORT_READY': {
         const spec = parseTestSpec(this.readProto('testSpec').text);
         const specUsable = spec.exists && (spec.taskId == null || spec.taskId === s.taskId);
         if (specUsable) {
+          const wait = await this.waitForWorkerIfOffline();
+          if (wait !== null) return wait;
           await this.testerStep();
         } else if (this.cfg.skipTestingIfNoTestSpec) {
           this.log.warn(
@@ -428,6 +453,28 @@ export class Runner extends EventEmitter {
     }
   }
 
+  /**
+   * In distributed mode, hold before launching coder/tester while no worker
+   * is online. Returns null to proceed, or a boolean loop-result to bubble up.
+   * @returns {Promise<boolean|null>}
+   */
+  async waitForWorkerIfOffline() {
+    if (!this.remote || this.remote.online()) {
+      this.waitingForWorkerLogged = false;
+      return null;
+    }
+    if (this.runOnce) {
+      this.exitInfo = { ok: false, gated: false, message: 'no worker online; cannot dispatch' };
+      return true;
+    }
+    if (!this.waitingForWorkerLogged) {
+      this.log.info('waiting for a worker to register before dispatching');
+      this.waitingForWorkerLogged = true;
+    }
+    await this.waitForWake();
+    return false;
+  }
+
   afterOrchestrationOnce() {
     if (!this.runOnce) return false;
     const s = this.st;
@@ -446,6 +493,22 @@ export class Runner extends EventEmitter {
    * @returns {Promise<import('./agents.js').AgentResult>}
    */
   async launch(role, prompt) {
+    if (this.remote && (role === 'coder' || role === 'tester')) {
+      this.agentAbort = new AbortController();
+      this.log.info(`dispatching ${role} to worker ${this.remote.workerId()} (task ${this.st.taskId ?? '?'})`);
+      const res = await this.remote.runAgent(
+        role, prompt, this.st.taskId ?? '', this.agentAbort.signal, this.cfg.agents[role].timeoutMinutes,
+      );
+      this.agentAbort = null;
+      this.log.info(
+        res.workerOffline ? `${role} dispatch failed: worker offline`
+        : res.dispatchTimeout ? `${role} dispatch timed out waiting for a result`
+        : res.gitConflict ? `${role} hit a git conflict on the worker (${res.gitConflict.stage})`
+        : res.remoteError ? `${role} failed on the worker: ${res.remoteError}`
+        : `${role} finished on worker: code=${res.code}${res.timedOut ? ' (timed out)' : ''} committed=${res.committed} pushed=${res.pushed}`,
+      );
+      return res;
+    }
     this.agentAbort = new AbortController();
     const agentCfg = this.cfg.agents[role];
     this.log.info(`launching ${role}: ${agentCfg.command} ${agentCfg.args.join(' ')}`);
@@ -470,7 +533,7 @@ export class Runner extends EventEmitter {
   /**
    * Common post-exit checks. Returns true if the step must abort.
    * @param {'coder'|'tester'|'orchestrator'} role
-   * @param {import('./agents.js').AgentResult} res
+   * @param {import('./remote.js').RemoteAgentResult} res
    */
   agentAborted(role, res) {
     if (this.stopRequested) {
@@ -480,9 +543,35 @@ export class Runner extends EventEmitter {
       this.log.warn(`${role} interrupted by stop; task ${this.st.taskId ?? '?'} left unfinished`);
       return true;
     }
+    if (res.workerOffline) {
+      this.gate(`Worker went offline while the ${role} was running (task ${this.st.taskId ?? '?'}).`, [
+        'RUNNING TASK -> WORKER OFFLINE -> HUMAN GATE',
+        'The task will NOT be restarted automatically. When the worker reconnects,',
+        'review the repository state and run "asterim-pipeline resume"; the pipeline',
+        'will re-evaluate the protocol files to find the safe recovery point.',
+      ]);
+      return true;
+    }
+    if (res.dispatchTimeout) {
+      this.gate(`No ${role} result arrived from the worker within the dispatch timeout.`, [
+        `Task: ${this.st.taskId ?? '?'}. The worker may be stuck; check its logs.`,
+      ]);
+      return true;
+    }
+    if (res.gitConflict) {
+      this.gate(`WORKER_GIT_CONFLICT: the worker could not ${res.gitConflict.stage === 'push' ? 'push' : 'fast-forward pull'} (task ${this.st.taskId ?? '?'}).`, [
+        res.gitConflict.detail,
+        'Resolve the git state on the worker manually (no destructive commands are ever run automatically).',
+      ]);
+      return true;
+    }
+    if (res.remoteError) {
+      this.gate(`Worker reported an error while running the ${role}: ${res.remoteError}`, []);
+      return true;
+    }
     if (res.spawnError) {
       this.gate(`The ${role} could not be launched: ${res.spawnError}`, [
-        `Check the "${role}" command in .pipeline/config.json.`,
+        `Check the "${role}" command in .pipeline/config.json${this.remote ? ' on the worker machine' : ''}.`,
       ]);
       return true;
     }
@@ -504,7 +593,17 @@ export class Runner extends EventEmitter {
     }
 
     const useGit = this.cfg.git.enabled && gitx.isRepo(this.root);
-    if (useGit && this.cfg.git.pullBeforeCycle) {
+    if (this.remote) {
+      // The worker syncs via git: the task protocol files must be on the
+      // remote before dispatch (commit is additive and scoped to those files).
+      const pub = this.remote.publishTaskFiles(s.taskId ?? '');
+      if (!pub.ok) {
+        this.gate(`Could not publish the task files to the git remote: ${pub.error}`, [
+          'Distributed mode requires a shared git remote with an upstream-tracking branch.',
+        ]);
+        return;
+      }
+    } else if (useGit && this.cfg.git.pullBeforeCycle) {
       const pull = gitx.pullFfOnly(this.root);
       if (!pull.ok) {
         this.gate('git pull --ff-only failed before the coder cycle.', [pull.stderr || pull.stdout]);
@@ -516,6 +615,16 @@ export class Runner extends EventEmitter {
     this.setState('CODING');
     const res = await this.launch('coder', renderPrompt(this.cfg.prompts.coder, { taskId: s.taskId ?? '' }));
     if (this.agentAborted('coder', res)) return;
+
+    if (this.remote) {
+      const sync = this.remote.syncAfterRemote('coder', res);
+      if (!sync.ok) {
+        this.gate(`Could not sync the coder's work from the git remote: ${sync.error}`, [
+          'Resolve the git state manually, then run "asterim-pipeline resume".',
+        ]);
+        return;
+      }
+    }
 
     const repF = this.readProto('coderReport');
     const rep = parseCoderReport(repF.text);
@@ -575,6 +684,14 @@ export class Runner extends EventEmitter {
     this.setState('TESTING');
     const res = await this.launch('tester', renderPrompt(this.cfg.prompts.tester, { taskId: s.taskId ?? '' }));
     if (this.agentAborted('tester', res)) return;
+
+    if (this.remote) {
+      const sync = this.remote.syncAfterRemote('tester', res);
+      if (!sync.ok) {
+        this.gate(`Could not sync the tester's report: ${sync.error}`, []);
+        return;
+      }
+    }
 
     const repF = this.readProto('testReport');
     const rep = parseTestReport(repF.text);

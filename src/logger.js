@@ -12,17 +12,18 @@ import { PIPELINE_DIR } from './config.js';
 
 /**
  * @param {string} projectRoot
- * @param {{quiet?: boolean}} [opts]
+ * @param {{quiet?: boolean, prefix?: string}} [opts] prefix tags every line, e.g. "worker"
  * @returns {Logger}
  */
 export function createLogger(projectRoot, opts = {}) {
   const dir = path.join(projectRoot, PIPELINE_DIR);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'pipeline.log');
+  const tag = opts.prefix ? `[${opts.prefix}] ` : '';
 
   /** @param {string} level @param {string} msg */
   function write(level, msg) {
-    const line = `${new Date().toISOString()} [${level}] ${msg}`;
+    const line = `${new Date().toISOString()} [${level}] ${tag}${msg}`;
     try {
       fs.appendFileSync(file, line + '\n', 'utf8');
     } catch {
