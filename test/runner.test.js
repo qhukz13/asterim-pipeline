@@ -302,11 +302,19 @@ test('phase completion from the orchestrator gates with a summary', async () => 
   }
 });
 
-test('orchestrator that exits without updating the task file gates', async () => {
+test('orchestrator that exits without updating the task file gates, quoting what it said', async () => {
   const root = makeRoot();
   try {
     seedTask(root);
-    const lazyOrch = fakeAgent(root, 'lazy-orch', `bump('orch'); process.exit(0);`);
+    // Mirrors the real failure: agy prints a permission complaint, writes
+    // nothing, and exits 0.
+    const lazyOrch = fakeAgent(
+      root,
+      'lazy-orch',
+      `bump('orch');
+       console.log('no output produced — a tool required the "command" permission');
+       process.exit(0);`,
+    );
     const r = makeRunner(root, {
       coder: normalCoder(root),
       tester: normalTester(root, 'PASS'),
@@ -315,6 +323,10 @@ test('orchestrator that exits without updating the task file gates', async () =>
     const info = await r.start({ once: true });
     assert.equal(info.gated, true);
     assert.match(r.st.gateReason ?? '', /without updating tasks\/current.md/);
+    // The human gate must carry the agent's own words, not just the symptom.
+    const log = read(root, '.pipeline/pipeline.log') ?? '';
+    assert.match(log, /Last output from the agent/);
+    assert.match(log, /required the "command" permission/);
   } finally {
     cleanupRoot(root);
   }

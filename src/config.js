@@ -65,6 +65,7 @@ export const DEFAULT_FILES = {
  *   maxConsecutiveTestFailures: number,
  *   maxConsecutiveBlocked: number,
  *   skipTestingIfNoTestSpec: boolean,
+ *   streamAgentOutput: boolean,
  *   agents: {coder: AgentConfig, tester: AgentConfig, orchestrator: AgentConfig},
  *   git: {enabled: boolean, validateCoderCommit: boolean, pullBeforeCycle: boolean, pushAfterCommit: boolean},
  *   remote: {bind: string, port: number, heartbeatIntervalMs: number, heartbeatTimeoutMs: number,
@@ -98,6 +99,9 @@ export function defaultConfig(projectRoot) {
     maxConsecutiveTestFailures: 3,
     maxConsecutiveBlocked: 2,
     skipTestingIfNoTestSpec: true,
+    // Mirror locally-run agent output into the pipeline terminal (it is
+    // always captured to .pipeline/logs/ regardless).
+    streamAgentOutput: true,
     agents: {
       coder: agentDefaults('claude'),
       tester: agentDefaults('claude'),
@@ -143,7 +147,7 @@ export function mergeConfig(projectRoot, raw) {
   for (const key of /** @type {const} */ (['watchDebounceMs', 'maxConsecutiveTestFailures', 'maxConsecutiveBlocked'])) {
     if (typeof raw[key] === 'number' && raw[key] >= 0) cfg[key] = raw[key];
   }
-  for (const key of /** @type {const} */ (['humanGateOnPhaseComplete', 'skipTestingIfNoTestSpec'])) {
+  for (const key of /** @type {const} */ (['humanGateOnPhaseComplete', 'skipTestingIfNoTestSpec', 'streamAgentOutput'])) {
     if (typeof raw[key] === 'boolean') cfg[key] = raw[key];
   }
   for (const role of /** @type {const} */ (['coder', 'tester', 'orchestrator'])) {

@@ -550,6 +550,19 @@ export class Runner extends EventEmitter {
     this.agentAbort = new AbortController();
     const agentCfg = this.cfg.agents[role];
     this.log.info(`launching ${role}: ${agentCfg.command} ${agentCfg.args.join(' ')}`);
+    // Mirror the agent's output into this terminal, one prefixed line at a
+    // time, so a locally-run agent (typically the orchestrator) is not
+    // silent. It is captured to .pipeline/logs/ either way.
+    let pending = '';
+    const emit = (/** @type {string} */ line) => process.stdout.write(`  ${role} | ${line}\n`);
+    const onOutput = this.cfg.streamAgentOutput
+      ? (/** @type {Buffer} */ chunk) => {
+          pending += chunk.toString();
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() ?? '';
+          for (const line of lines) emit(line);
+        }
+      : undefined;
     const res = await runAgent(role, agentCfg, prompt, this.root, {
       onSpawn: (pid) => {
         this.st[`${role}Pid`] = pid;
@@ -557,7 +570,9 @@ export class Runner extends EventEmitter {
         this.log.info(`${role} running (pid ${pid})`);
       },
       signal: this.agentAbort.signal,
+      onOutput,
     });
+    if (pending.trim() !== '') emit(pending);
     this.agentAbort = null;
     this.st[`${role}Pid`] = null;
     this.log.info(
@@ -683,11 +698,14 @@ export class Runner extends EventEmitter {
       return;
     }
     if (!rep.valid) {
-      this.gate(`Coder exited (code ${res.code}) but ${this.cfg.files.coderReport} is missing or malformed.`, rep.problems);
+      this.gate(`Coder exited (code ${res.code}) but ${this.cfg.files.coderReport} is missing or malformed.`, [
+        ...rep.problems,
+        ...agentOutputDetail(res),
+      ]);
       return;
     }
     if (rep.taskId !== s.taskId) {
-      this.gate(`Coder report is for task ${rep.taskId}, expected ${s.taskId}.`, []);
+      this.gate(`Coder report is for task ${rep.taskId}, expected ${s.taskId}.`, agentOutputDetail(res));
       return;
     }
     s.lastCoderStatus = rep.status;
@@ -758,11 +776,14 @@ export class Runner extends EventEmitter {
       return;
     }
     if (!rep.valid) {
-      this.gate(`Tester exited (code ${res.code}) but ${this.cfg.files.testReport} is missing or malformed.`, rep.problems);
+      this.gate(`Tester exited (code ${res.code}) but ${this.cfg.files.testReport} is missing or malformed.`, [
+        ...rep.problems,
+        ...agentOutputDetail(res),
+      ]);
       return;
     }
     if (rep.taskId !== s.taskId) {
-      this.gate(`Test report is for task ${rep.taskId}, expected ${s.taskId}.`, []);
+      this.gate(`Test report is for task ${rep.taskId}, expected ${s.taskId}.`, agentOutputDetail(res));
       return;
     }
     s.lastTestResult = rep.result;
@@ -797,13 +818,14 @@ export class Runner extends EventEmitter {
     if (after.hash == null || after.hash === before.hash) {
       this.gate(`Orchestrator exited (code ${res.code}) without updating ${this.cfg.files.task}.`, [
         'The pipeline cannot determine the next task.',
+        ...agentOutputDetail(res),
       ]);
       return;
     }
     const task = parseTaskFile(after.text);
     s.hashes.task = after.hash;
     if (!task.valid) {
-      this.gate(`Orchestrator wrote a malformed ${this.cfg.files.task}.`, task.problems);
+      this.gate(`Orchestrator wrote a malformed ${this.cfg.files.task}.`, [...task.problems, ...agentOutputDetail(res)]);
       return;
     }
     if (task.phaseComplete) {

@@ -210,6 +210,21 @@ Trim the list to what your project actually needs. If a run still stalls,
 the agent log (`.pipeline/logs/coder-*.log`) names the exact tool call that
 was denied — add that one and re-run.
 
+**The orchestrator has its own permission system.** Antigravity is a
+different program with its own settings; granting Claude permissions does
+nothing for it. If `agy` exits without writing the task file and complains
+that a tool "required the … permission that headless mode cannot prompt
+for", fix it in Antigravity's own config
+(`~/.gemini/antigravity-cli/settings.json`): add the project to
+`trustedWorkspaces` and add the allow-rules it names. The orchestrator also
+needs print mode — `"orchestratorArgs": ["-p"]` — and note `agy` applies its
+own `--print-timeout` (5 minutes by default) independently of
+`timeoutMinutes` here.
+
+Whatever an agent prints is mirrored into the pipeline terminal (disable
+with `"streamAgentOutput": false`) and quoted in the human gate, so a
+refusal like this is visible without opening a log.
+
 Alternatives, in increasing order of bluntness:
 
 - Per-agent flags in `.pipeline/config.json`, e.g.
