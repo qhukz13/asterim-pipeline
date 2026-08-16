@@ -38,9 +38,26 @@ export const DEFAULT_PROMPTS = {
     '(use Result: FAIL instead if verification failed). The rest of the report is free-form.\n' +
     'Return the process exit status based on whether the required verification passed.',
   orchestrator:
+    'You are the ORCHESTRATOR. Your entire job is: read the reports, judge the result, and write the next task. ' +
+    'Other agents do the implementation and the testing — you never do either yourself.\n' +
     'Read AGENTS.md, CLAUDE.md, {coderReportFile}, and {testReportFile}.\n' +
     'Review the implementation and test results for task {taskId}{trigger}.\n' +
-    'Decide the next task. Do not modify implementation code yourself.\n' +
+    '\n' +
+    'HARD LIMITS — tool permissions are pre-approved for this run, so nothing but you enforces these:\n' +
+    '  - Do NOT write, edit, refactor, or delete any source, config, or test code.\n' +
+    '  - Do NOT run tests, builds, linters, typecheckers, package installers, or any other long-running command. ' +
+    'The tester already ran the required verification; re-running it here wastes the session and can leave the ' +
+    'working tree dirty for the next agent.\n' +
+    '  - Do NOT commit, push, stage, stash, or otherwise change git state. The pipeline owns git.\n' +
+    '  - The ONLY files you may create or modify are {taskFile} and {testSpecFile}.\n' +
+    '  - Read-only inspection is encouraged: read any file, and use read-only git (log, diff, show, status) ' +
+    'to check what the coder actually changed.\n' +
+    '\n' +
+    'You are running non-interactively and get exactly ONE session: do not end your turn with a progress update, ' +
+    'and do not leave work running in the background. Write the task file in this session or the pipeline stalls.\n' +
+    'Decide ONE next task (not a list). If the reports show the work is incomplete, unverified, or the tests ' +
+    'failed, the next task is a focused fix task quoting the specific failure. If the coder reported an unrelated ' +
+    'problem it discovered, record it as a separate future task rather than expanding the current one.\n' +
     'Write the next task to {taskFile} (that exact path). It MUST contain an exact plain-text line "Task-ID: <id>" ' +
     '(no markdown bold) and optionally "Phase: <n>"; if tests must be run for it, write {testSpecFile} ' +
     '(that exact path) with a matching "Task-ID: <id>" line.\n' +
@@ -105,7 +122,21 @@ export function defaultConfig(projectRoot) {
     agents: {
       coder: agentDefaults('claude'),
       tester: agentDefaults('claude'),
-      orchestrator: agentDefaults('agy', { args: [], timeoutMinutes: 30 }),
+      // Antigravity differs from claude in two ways that matter here:
+      //   * its "-p" TAKES the prompt as its value, so -p must come last and
+      //     the prompt is passed as an argument, not on stdin;
+      //   * it enforces its own --print-timeout (5m by default), separate
+      //     from timeoutMinutes below.
+      // Permission prompts are skipped because headless mode cannot answer
+      // them; the orchestrator only reads reports and writes two markdown
+      // files, and that narrow remit is spelled out in its prompt. Drop the
+      // flag (and add allow-rules in Antigravity's own settings.json) if you
+      // would rather gate it per tool.
+      orchestrator: agentDefaults('agy', {
+        args: ['--dangerously-skip-permissions', '--print-timeout', '20m', '-p'],
+        promptVia: 'arg',
+        timeoutMinutes: 30,
+      }),
     },
     git: { enabled: true, validateCoderCommit: true, pullBeforeCycle: false, pushAfterCommit: false },
     remote: {

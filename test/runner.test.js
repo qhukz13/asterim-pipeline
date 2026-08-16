@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { Runner } from '../src/runner.js';
-import { DEFAULT_PROMPTS } from '../src/config.js';
+import { DEFAULT_PROMPTS, defaultConfig } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
 import { writeState, defaultState, readState } from '../src/store.js';
 import { writeControl } from '../src/control.js';
@@ -150,6 +150,28 @@ test('agent prompts use the configured protocol paths, never hardcoded ones', as
   } finally {
     cleanupRoot(root);
   }
+});
+
+test('the orchestrator prompt confines it to reviewing and dispatching', () => {
+  const p = DEFAULT_PROMPTS.orchestrator;
+  // Permissions are pre-approved for this agent, so the prompt is the only
+  // thing keeping it out of the code and the test suite.
+  assert.match(p, /Do NOT write, edit, refactor, or delete any source/);
+  assert.match(p, /Do NOT run tests, builds, linters/);
+  assert.match(p, /Do NOT commit, push/);
+  assert.match(p, /ONLY files you may create or modify are \{taskFile\} and \{testSpecFile\}/);
+  assert.match(p, /read-only git/i);
+  assert.match(p, /ONE session/);
+});
+
+test('the orchestrator is launched in print mode with the prompt as -p\'s value', () => {
+  const { args, promptVia } = defaultConfig('/x').agents.orchestrator;
+  // agy's -p consumes the NEXT argument as the prompt, so it must be last
+  // and the prompt must be passed as an argument (not piped on stdin) —
+  // otherwise -p swallows the following flag and runs that as the prompt.
+  assert.equal(promptVia, 'arg');
+  assert.equal(args.at(-1), '-p');
+  assert.ok(args.includes('--dangerously-skip-permissions'));
 });
 
 test('default prompts contain no hardcoded protocol paths', () => {
