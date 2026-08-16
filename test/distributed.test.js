@@ -220,6 +220,85 @@ test('distributed: worker crash mid-task -> WORKER OFFLINE -> HUMAN_GATE; restar
   }
 });
 
+test('distributed: a denied write surfaces the agent output in the human gate', async () => {
+  const { orchRoot, workerRoot, cleanup } = makeGitPair();
+  /** @type {import('node:child_process').ChildProcess|null} */
+  let workerChild = null;
+  const { server, runner } = orchestratorPieces(orchRoot);
+  try {
+    // A coder that explains itself and writes nothing — exactly what Claude
+    // does when its file writes are denied in headless mode.
+    const denied = fakeAgent(
+      workerRoot,
+      'wdenied',
+      `bump('coder');
+       console.log('I could not execute the task. Write to reports/current.md was refused.');
+       process.exit(0);`,
+    );
+    writeWorkerConfig(workerRoot, denied, workerTester(workerRoot));
+    const port = await server.listen();
+    const w = spawnWorker(workerRoot, port);
+    workerChild = w.child;
+    await waitFor(() => server.online(), 10000);
+
+    write(orchRoot, 'tasks/current.md', 'Task-ID: T-1\nPhase: 1\n');
+    write(orchRoot, 'test/current.md', 'Task-ID: T-1\nRun tests.\n');
+
+    const info = await runner.start({ once: true });
+    assert.equal(info.gated, true);
+    assert.match(runner.st.gateReason ?? '', /did not (create|modify)/);
+
+    // The gate banner (in the log) must quote the agent's own words so the
+    // human does not have to open a log on the other machine.
+    const log = read(orchRoot, '.pipeline/pipeline.log') ?? '';
+    assert.match(log, /Last output from the agent/);
+    assert.match(log, /Write to reports\/current\.md was refused/);
+  } finally {
+    workerChild?.kill();
+    server.close();
+    cleanup();
+  }
+});
+
+test('distributed: a successful run sends no agent output over the LAN', async () => {
+  const { orchRoot, workerRoot, cleanup } = makeGitPair();
+  /** @type {import('node:child_process').ChildProcess|null} */
+  let workerChild = null;
+  const { server, runner } = orchestratorPieces(orchRoot);
+  try {
+    const chatty = fakeAgent(
+      workerRoot,
+      'wchatty',
+      `bump('coder');
+       console.log('SECRET_TRANSCRIPT_MARKER internal reasoning that must stay local');
+       const cp = require('child_process');
+       const id = readTaskId();
+       fs.writeFileSync(path.join(root, 'src.txt'), 'impl\\n');
+       fs.writeFileSync(path.join(root, 'reports', 'current.md'), 'Task-ID: ' + id + '\\nStatus: COMPLETE\\n');
+       cp.execSync('git add -A', { cwd: root });
+       cp.execSync('git commit -q -m "impl"', { cwd: root });
+       process.exit(0);`,
+    );
+    writeWorkerConfig(workerRoot, chatty, workerTester(workerRoot));
+    const port = await server.listen();
+    const w = spawnWorker(workerRoot, port);
+    workerChild = w.child;
+    await waitFor(() => server.online(), 10000);
+
+    write(orchRoot, 'tasks/current.md', 'Task-ID: T-1\nPhase: 1\n');
+    write(orchRoot, 'test/current.md', 'Task-ID: T-1\nRun tests.\n');
+
+    const info = await runner.start({ once: true });
+    assert.equal(info.gated, false, info.message);
+    const log = read(orchRoot, '.pipeline/pipeline.log') ?? '';
+    assert.ok(!log.includes('SECRET_TRANSCRIPT_MARKER'), 'transcripts must not leave the worker on success');
+  } finally {
+    workerChild?.kill();
+    server.close();
+    cleanup();
+  }
+});
+
 test('distributed: run-once with no worker online reports instead of dispatching', async () => {
   const { orchRoot, cleanup } = makeGitPair();
   const { server, runner } = orchestratorPieces(orchRoot);

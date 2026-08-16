@@ -31,9 +31,10 @@ export class Worker {
    * @param {{root: string, host: string, port: number, token: string, workerId: string,
    *          agents: import('./config.js').Config['agents'],
    *          files: import('./config.js').Config['files'],
-   *          logger: import('./logger.js').Logger}} opts
+   *          logger: import('./logger.js').Logger,
+   *          failureOutput?: {enabled: boolean, chars: number}}} opts
    */
-  constructor({ root, host, port, token, workerId, agents, files, logger }) {
+  constructor({ root, host, port, token, workerId, agents, files, logger, failureOutput }) {
     this.root = root;
     this.base = `http://${host}:${port}`;
     this.token = token;
@@ -41,6 +42,8 @@ export class Worker {
     this.agents = agents;
     this.files = files;
     this.log = logger;
+    /** On failure only: how much agent output may be sent back (0 = none). */
+    this.failureOutputChars = failureOutput?.enabled === false ? 0 : (failureOutput?.chars ?? 2000);
     /** @type {string|null} */
     this.sessionId = null;
     this.heartbeatIntervalMs = 10000;
@@ -343,12 +346,18 @@ export class Worker {
         ? `did not create ${reportRel}`
         : `did not modify ${reportRel} (it still holds the previous content)`;
       this.log.warn(`[worker] [${role}] ${what}`);
+      const tail = this.tailOf(res.logFile);
+      if (tail) {
+        // Make the reason obvious on the worker's own terminal too.
+        this.log.warn(`[worker] [${role}] last output follows:\n${'-'.repeat(60)}\n${tail}\n${'-'.repeat(60)}`);
+      }
       return makeMsg(MSG.ERROR, this.envelope({
         dispatchId: cmd.dispatchId,
         message:
           `the ${role} exited (code ${res.code}) but ${what} in the worker clone at ${this.root}. ` +
           'This usually means the agent was denied permission to write the file in headless mode. ' +
           `Full agent output is on the worker at ${workerLog}.`,
+        outputTail: tail,
       }));
     }
 
@@ -381,10 +390,30 @@ export class Worker {
       exitCode: res.code,
       timedOut: res.timedOut,
       spawnError: res.spawnError,
+      // Only when something went wrong; a clean run sends no output.
+      outputTail: res.spawnError || res.timedOut ? this.tailOf(res.logFile) : null,
       committed,
       pushed,
       reportContent,
     }));
+  }
+
+  /**
+   * Tail of an agent log, for FAILED runs only. Successful runs never send
+   * output anywhere; this is bounded and can be disabled entirely with
+   * remote.includeFailureOutput = false.
+   * @param {string} logFile
+   * @returns {string|null}
+   */
+  tailOf(logFile) {
+    if (this.failureOutputChars <= 0) return null;
+    try {
+      const text = fs.readFileSync(logFile, 'utf8');
+      const trimmed = text.length > this.failureOutputChars ? text.slice(-this.failureOutputChars) : text;
+      return trimmed.trim() === '' ? null : (text.length > this.failureOutputChars ? '…' : '') + trimmed;
+    } catch {
+      return null;
+    }
   }
 
   /** @param {string} dispatchId @param {Record<string, unknown>} result */

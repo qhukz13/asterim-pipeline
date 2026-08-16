@@ -291,6 +291,7 @@ async function workerCmd(args) {
   const worker = new Worker({
     root, host, port, token, workerId,
     agents: config.agents, files: config.files, logger,
+    failureOutput: { enabled: config.remote.includeFailureOutput, chars: config.remote.failureOutputChars },
   });
   const onSigint = () => {
     logger.info('[worker] shutting down');

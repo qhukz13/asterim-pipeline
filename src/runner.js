@@ -21,6 +21,27 @@ import * as gitx from './git.js';
 
 const SAFETY_TICK_MS = 5000;
 
+/**
+ * Gate detail lines carrying the agent's own last words, when the worker
+ * sent them (failed runs only).
+ * @param {import('./remote.js').RemoteAgentResult} res
+ * @returns {string[]}
+ */
+function agentOutputDetail(res) {
+  let tail = res.outputTail ?? null;
+  if (tail == null && typeof res.logFileLocal === 'string') {
+    try {
+      const text = fs.readFileSync(res.logFileLocal, 'utf8');
+      tail = text.length > 2000 ? '…' + text.slice(-2000) : text;
+      if (tail.trim() === '') tail = null;
+    } catch {
+      tail = null;
+    }
+  }
+  if (!tail) return [];
+  return ['', 'Last output from the agent:', '-'.repeat(50), ...tail.split(/\r?\n/), '-'.repeat(50)];
+}
+
 export class Runner extends EventEmitter {
   /**
    * @param {{root: string, config: import('./config.js').Config, logger: import('./logger.js').Logger,
@@ -507,7 +528,7 @@ export class Runner extends EventEmitter {
   /**
    * @param {'coder'|'tester'|'orchestrator'} role
    * @param {string} prompt
-   * @returns {Promise<import('./agents.js').AgentResult>}
+   * @returns {Promise<import('./remote.js').RemoteAgentResult>}
    */
   async launch(role, prompt) {
     if (this.remote && (role === 'coder' || role === 'tester')) {
@@ -544,7 +565,8 @@ export class Runner extends EventEmitter {
         ? `${role} failed to launch: ${res.spawnError}`
         : `${role} exited code=${res.code}${res.timedOut ? ' (timed out)' : ''} log=${path.relative(this.root, res.logFile)}`,
     );
-    return res;
+    // Local mode: the log is right here, so a gate can quote it too.
+    return { ...res, logFileLocal: res.logFile };
   }
 
   /**
@@ -583,18 +605,20 @@ export class Runner extends EventEmitter {
       return true;
     }
     if (res.remoteError) {
-      this.gate(`Worker reported an error while running the ${role}: ${res.remoteError}`, []);
+      this.gate(`Worker reported an error while running the ${role}: ${res.remoteError}`, agentOutputDetail(res));
       return true;
     }
     if (res.spawnError) {
       this.gate(`The ${role} could not be launched: ${res.spawnError}`, [
         `Check the "${role}" command in .pipeline/config.json${this.remote ? ' on the worker machine' : ''}.`,
+        ...agentOutputDetail(res),
       ]);
       return true;
     }
     if (res.timedOut) {
       this.gate(`The ${role} exceeded its ${this.cfg.agents[role].timeoutMinutes} minute timeout and was killed.`, [
         `Task: ${this.st.taskId ?? '?'}`,
+        ...agentOutputDetail(res),
       ]);
       return true;
     }

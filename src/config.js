@@ -62,7 +62,8 @@ export const DEFAULT_FILES = {
  *   git: {enabled: boolean, validateCoderCommit: boolean, pullBeforeCycle: boolean, pushAfterCommit: boolean},
  *   remote: {bind: string, port: number, heartbeatIntervalMs: number, heartbeatTimeoutMs: number,
  *            pollTimeoutMs: number, redeliverMs: number, dispatchGraceMinutes: number,
- *            allowPublicClients: boolean, autoCommitTaskFiles: boolean},
+ *            allowPublicClients: boolean, autoCommitTaskFiles: boolean,
+ *            includeFailureOutput: boolean, failureOutputChars: number},
  *   prompts: {coder: string, tester: string, orchestrator: string},
  *   files: {task: string, coderReport: string, testSpec: string, testReport: string},
  * }} Config
@@ -105,7 +106,13 @@ export function defaultConfig(projectRoot) {
       redeliverMs: 5000, // how often an unacknowledged command is re-offered to the worker
       dispatchGraceMinutes: 5, // added to the agent timeout for the orchestrator-side dispatch timeout
       allowPublicClients: false,
-      autoCommitTaskFiles: true, // commit+push tasks/current.md & test/current.md before dispatching
+      autoCommitTaskFiles: true, // commit+push the task protocol files before dispatching
+      // On a FAILED run only, let the worker send back the tail of the
+      // agent's output so the human gate can explain itself without a trip
+      // to the other machine. Successful runs never send output. Set false
+      // to keep every byte of agent output on the machine that produced it.
+      includeFailureOutput: true,
+      failureOutputChars: 2000,
     },
     prompts: { ...DEFAULT_PROMPTS },
     files: { ...DEFAULT_FILES },
@@ -155,10 +162,11 @@ export function mergeConfig(projectRoot, raw) {
     if (typeof raw.remote.bind === 'string' && raw.remote.bind.trim() !== '') cfg.remote.bind = raw.remote.bind;
     for (const key of /** @type {const} */ ([
       'port', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'pollTimeoutMs', 'redeliverMs', 'dispatchGraceMinutes',
+      'failureOutputChars',
     ])) {
       if (typeof raw.remote[key] === 'number' && raw.remote[key] >= 0) cfg.remote[key] = raw.remote[key];
     }
-    for (const key of /** @type {const} */ (['allowPublicClients', 'autoCommitTaskFiles'])) {
+    for (const key of /** @type {const} */ (['allowPublicClients', 'autoCommitTaskFiles', 'includeFailureOutput'])) {
       if (typeof raw.remote[key] === 'boolean') cfg.remote[key] = raw.remote[key];
     }
   }

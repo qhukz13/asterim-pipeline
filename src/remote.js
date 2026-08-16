@@ -12,7 +12,8 @@ import { git, pullFfOnly, push } from './git.js';
  * @typedef {import('./agents.js').AgentResult & {
  *   workerOffline?: boolean, dispatchTimeout?: boolean, remoteError?: string|null,
  *   gitConflict?: {stage: string, detail: string}|null, reportContent?: string|null,
- *   committed?: boolean, pushed?: boolean,
+ *   committed?: boolean, pushed?: boolean, outputTail?: string|null,
+ *   logFileLocal?: string,
  * }} RemoteAgentResult
  */
 
@@ -92,7 +93,7 @@ export class RemoteExecutor {
     const base = {
       code: null, timedOut: false, spawnError: null, pid: null, logFile: '(on worker)',
       workerOffline: false, dispatchTimeout: false, remoteError: null, gitConflict: null,
-      reportContent: null, committed: false, pushed: false,
+      reportContent: null, committed: false, pushed: false, outputTail: null,
     };
     const agentMs = timeoutMinutes > 0 ? timeoutMinutes * 60_000 : 6 * 3_600_000;
     const timeoutMs = agentMs + this.cfg.remote.dispatchGraceMinutes * 60_000;
@@ -111,13 +112,14 @@ export class RemoteExecutor {
       case 'WORKER_GIT_CONFLICT':
         return { ...base, gitConflict: { stage: String(msg.stage), detail: String(msg.detail ?? '') } };
       case 'ERROR':
-        return { ...base, remoteError: String(msg.message) };
+        return { ...base, remoteError: String(msg.message), outputTail: typeof msg.outputTail === 'string' ? msg.outputTail : null };
       default: // CODER_RESULT / TESTER_RESULT
         return {
           ...base,
           code: typeof msg.exitCode === 'number' ? msg.exitCode : null,
           timedOut: msg.timedOut === true,
           spawnError: typeof msg.spawnError === 'string' ? msg.spawnError : null,
+          outputTail: typeof msg.outputTail === 'string' ? msg.outputTail : null,
           reportContent: typeof msg.reportContent === 'string' ? msg.reportContent : null,
           committed: msg.committed === true,
           pushed: msg.pushed === true,

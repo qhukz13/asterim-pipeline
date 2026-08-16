@@ -335,12 +335,21 @@ git command (`reset --hard`, `clean`, `push --force`) is ever run anywhere.
 | worker → PC | `WORKER_REGISTER`, `WORKER_HEARTBEAT`, `WORKER_POLL` | worker id, session id, current agent role, current task id |
 | PC → worker | `RUN_CODER`, `RUN_TESTER` | dispatch id, task id, the rendered prompt text |
 | PC → worker | `PAUSE`, `STOP`, `NONE` | control signals, no payload |
-| worker → PC | `CODER_RESULT`, `TESTER_RESULT` | dispatch/task id, exit code, timed-out flag, committed/pushed flags, and the content of `reports/current.md` / `test/report.md` (capped at 256 KiB) |
+| worker → PC | `CODER_RESULT`, `TESTER_RESULT` | dispatch/task id, exit code, timed-out flag, committed/pushed flags, and the content of the coder/test report file (capped at 256 KiB) |
 | worker → PC | `WORKER_GIT_CONFLICT`, `ERROR` | stage (pull/push) and the git/agent error text |
+| worker → PC | **failed runs only** | the last 2 KB of the agent's output, so the human gate can explain itself — see below |
 
-Nothing else: no source code (that moves through git), no agent transcripts
-(they stay in the worker's `.pipeline/logs/`), no API keys, no environment
-variables, no project memory.
+Nothing else: no source code (that moves through git), no API keys, no
+environment variables, no project memory.
+
+**Agent output.** Transcripts stay on the machine that produced them
+(`.pipeline/logs/` on the worker). The one exception is a **failure**: when
+an agent exits without writing its report, fails to launch, or times out,
+the worker sends back the last `remote.failureOutputChars` (default 2000)
+characters of its output so the gate on the PC can quote the reason instead
+of sending you to another machine for it. A successful run sends none. Set
+`remote.includeFailureOutput: false` in the worker's `.pipeline/config.json`
+to keep every byte local.
 
 ### Observability
 
