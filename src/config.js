@@ -5,36 +5,40 @@ import path from 'node:path';
 
 export const PIPELINE_DIR = '.pipeline';
 
+// Protocol file paths are injected as {taskFile} / {coderReportFile} /
+// {testSpecFile} / {testReportFile} from `files` below — never hardcoded, or
+// an agent would read and write a different path than the pipeline watches.
 export const DEFAULT_PROMPTS = {
   coder:
-    'Read AGENTS.md, CLAUDE.md, and tasks/current.md.\n' +
+    'Read AGENTS.md, CLAUDE.md, and {taskFile}.\n' +
     'Execute the current task ({taskId}).\n' +
     'Before reporting completion, independently review the git diff against every acceptance criterion and fix any issues.\n' +
     'Run all required verification.\n' +
-    'Write the final report to reports/current.md. The report MUST begin with these two exact plain-text lines ' +
+    'Write the final report to {coderReportFile} (that exact path). The report MUST begin with these two exact plain-text lines ' +
     '(no markdown bold, no emoji, no extra words on the line):\n' +
     'Task-ID: {taskId}\n' +
     'Status: COMPLETE\n' +
     '(use Status: BLOCKED or Status: FAILED instead if you could not finish). The rest of the report is free-form.\n' +
     'Commit the completed work.',
   tester:
-    'Read AGENTS.md, CLAUDE.md, tasks/current.md, reports/current.md, and test/current.md.\n' +
-    'Execute ONLY the tests specified in test/current.md.\n' +
+    'Read AGENTS.md, CLAUDE.md, {taskFile}, {coderReportFile}, and {testSpecFile}.\n' +
+    'Execute ONLY the tests specified in {testSpecFile}.\n' +
     'Do not modify production code.\n' +
-    'Write the complete verification result to test/report.md. The report MUST begin with these two exact plain-text lines ' +
+    'Write the complete verification result to {testReportFile} (that exact path). The report MUST begin with these two exact plain-text lines ' +
     '(no markdown bold, no emoji, no extra words on the line):\n' +
     'Task-ID: {taskId}\n' +
     'Result: PASS\n' +
     '(use Result: FAIL instead if verification failed). The rest of the report is free-form.\n' +
     'Return the process exit status based on whether the required verification passed.',
   orchestrator:
-    'Read AGENTS.md, CLAUDE.md, reports/current.md, and test/report.md.\n' +
+    'Read AGENTS.md, CLAUDE.md, {coderReportFile}, and {testReportFile}.\n' +
     'Review the implementation and test results for task {taskId}{trigger}.\n' +
     'Decide the next task. Do not modify implementation code yourself.\n' +
-    'Write the next task to tasks/current.md. It MUST contain an exact plain-text line "Task-ID: <id>" ' +
-    '(no markdown bold) and optionally "Phase: <n>"; if tests must be run for it, write test/current.md ' +
-    'with a matching "Task-ID: <id>" line.\n' +
-    'If the current phase is complete, instead write "Status: PHASE_COMPLETE" to tasks/current.md.',
+    'Write the next task to {taskFile} (that exact path). It MUST contain an exact plain-text line "Task-ID: <id>" ' +
+    '(no markdown bold) and optionally "Phase: <n>"; if tests must be run for it, write {testSpecFile} ' +
+    '(that exact path) with a matching "Task-ID: <id>" line.\n' +
+    'Do not create or write any other task/report path variant.\n' +
+    'If the current phase is complete, instead write "Status: PHASE_COMPLETE" to {taskFile}.',
 };
 
 /** Protocol file locations, relative to project root. */

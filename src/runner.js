@@ -70,6 +70,23 @@ export class Runner extends EventEmitter {
     writeState(this.root, this.st);
   }
 
+  /**
+   * Variables available to every prompt template. The protocol paths come
+   * from config so an agent can never be told to use a path the pipeline
+   * does not watch.
+   * @param {Record<string, string>} [extra]
+   */
+  promptVars(extra = {}) {
+    return {
+      taskId: this.st.taskId ?? '',
+      taskFile: this.cfg.files.task,
+      coderReportFile: this.cfg.files.coderReport,
+      testSpecFile: this.cfg.files.testSpec,
+      testReportFile: this.cfg.files.testReport,
+      ...extra,
+    };
+  }
+
   /** @param {import('./state-machine.js').PipelineState} to */
   setState(to) {
     const from = this.st.state;
@@ -617,7 +634,7 @@ export class Runner extends EventEmitter {
     const reportBefore = this.readProto('coderReport').hash;
 
     this.setState('CODING');
-    const res = await this.launch('coder', renderPrompt(this.cfg.prompts.coder, { taskId: s.taskId ?? '' }));
+    const res = await this.launch('coder', renderPrompt(this.cfg.prompts.coder, this.promptVars()));
     if (this.agentAborted('coder', res)) return;
 
     if (this.remote) {
@@ -695,7 +712,7 @@ export class Runner extends EventEmitter {
     const s = this.st;
     const reportBefore = this.readProto('testReport').hash;
     this.setState('TESTING');
-    const res = await this.launch('tester', renderPrompt(this.cfg.prompts.tester, { taskId: s.taskId ?? '' }));
+    const res = await this.launch('tester', renderPrompt(this.cfg.prompts.tester, this.promptVars()));
     if (this.agentAborted('tester', res)) return;
 
     if (this.remote) {
@@ -748,10 +765,7 @@ export class Runner extends EventEmitter {
     const s = this.st;
     const before = this.readProto('task');
     this.setState('ORCHESTRATING');
-    const prompt = renderPrompt(this.cfg.prompts.orchestrator, {
-      taskId: s.taskId ?? '',
-      trigger: ` — note: ${trigger}`,
-    });
+    const prompt = renderPrompt(this.cfg.prompts.orchestrator, this.promptVars({ trigger: ` — note: ${trigger}` }));
     const res = await this.launch('orchestrator', prompt);
     if (this.agentAborted('orchestrator', res)) return;
 

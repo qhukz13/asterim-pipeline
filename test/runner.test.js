@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { Runner } from '../src/runner.js';
+import { DEFAULT_PROMPTS } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
 import { writeState, defaultState, readState } from '../src/store.js';
 import { writeControl } from '../src/control.js';
@@ -100,6 +101,62 @@ test('coder that exits without a report leads to HUMAN_GATE (exit code alone is 
     assert.match(r.st.gateReason ?? '', /code 97/);
   } finally {
     cleanupRoot(root);
+  }
+});
+
+test('agent prompts use the configured protocol paths, never hardcoded ones', async () => {
+  const root = makeRoot();
+  try {
+    // A project that uses tests/ (not test/) — the exact drift that made the
+    // orchestrator recreate a stray test/current.md every cycle.
+    const files = {
+      task: 'tasks/current.md',
+      coderReport: 'reports/current.md',
+      testSpec: 'tests/current.md',
+      testReport: 'tests/report.md',
+    };
+    write(root, files.task, 'Task-ID: T-1\nPhase: 1\n\nDo the thing.\n');
+    write(root, files.testSpec, 'Task-ID: T-1\nRun the tests.\n');
+
+    const save = (/** @type {string} */ role, /** @type {string} */ extra) =>
+      fakeAgent(root, `p-${role}`, `bump('${role}');
+        fs.writeFileSync(path.join(root, '.prompt-${role}'), prompt);
+        ${extra}
+        process.exit(0);`);
+    const coder = save('coder', `fs.mkdirSync(path.join(root, 'reports'), {recursive: true});
+      fs.writeFileSync(path.join(root, 'reports', 'current.md'), 'Task-ID: ' + readTaskId() + '\\nStatus: COMPLETE\\n');`);
+    const tester = save('tester', `fs.mkdirSync(path.join(root, 'tests'), {recursive: true});
+      fs.writeFileSync(path.join(root, 'tests', 'report.md'), 'Task-ID: ' + readTaskId() + '\\nResult: PASS\\n');`);
+    const orch = save('orch', `fs.writeFileSync(path.join(root, 'tasks', 'current.md'), 'Status: PHASE_COMPLETE\\nPhase: 1\\n');`);
+
+    const config = testConfig(root, { coder, tester, orchestrator: orch });
+    config.files = files; // override the fixtures' pinned defaults
+    const r = new Runner({ root, config, logger: createLogger(root, { quiet: true }) });
+    const info = await r.start({ once: true });
+    assert.equal(info.gated, true); // phase complete
+    assert.match(r.st.gateReason ?? '', /Phase 1 has completed/);
+
+    for (const role of ['coder', 'tester', 'orch']) {
+      const p = read(root, `.prompt-${role}`) ?? '';
+      assert.ok(p !== '', `${role} received no prompt`);
+      assert.ok(!/(?:^|[^s])\btest\/(?:current|report)\.md/.test(p), `${role} prompt still names test/: ${p}`);
+    }
+    assert.match(read(root, '.prompt-tester') ?? '', /tests\/current\.md/);
+    assert.match(read(root, '.prompt-tester') ?? '', /tests\/report\.md/);
+    assert.match(read(root, '.prompt-orch') ?? '', /tests\/current\.md/);
+    assert.match(read(root, '.prompt-orch') ?? '', /tests\/report\.md/);
+    assert.match(read(root, '.prompt-coder') ?? '', /tasks\/current\.md/);
+    assert.match(read(root, '.prompt-coder') ?? '', /reports\/current\.md/);
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('default prompts contain no hardcoded protocol paths', () => {
+  for (const [role, text] of Object.entries(DEFAULT_PROMPTS)) {
+    const hardcoded = text.match(/\b(?:tasks?|reports?|tests?)\/[\w-]+\.md\b/g);
+    assert.equal(hardcoded, null, `${role} prompt hardcodes ${hardcoded?.join(', ')}`);
+    assert.match(text, /\{\w+File\}/, `${role} prompt should reference a {…File} placeholder`);
   }
 });
 
