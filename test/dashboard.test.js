@@ -167,3 +167,23 @@ test('dashboardHtml is self-contained and escapes nothing server-side', () => {
   assert.ok(!/href\s*=\s*["']http/i.test(html), 'must not load external styles');
   assert.match(html, /\/dashboard\/data/);
 });
+
+test('dashboardHtml preserves expanded sections across the refresh', () => {
+  const html = dashboardHtml();
+  // Every collapsible carries a stable key…
+  assert.match(html, /data-key="/);
+  assert.match(html, /details\('task-body'/);
+  assert.match(html, /renderReport\('rep-coder'/);
+  assert.match(html, /renderReport\('rep-test'/);
+  assert.match(html, /details\('git-recent'/);
+  // …open state is tracked (toggle does not bubble, so capture is required)…
+  assert.match(html, /openKeys/);
+  assert.match(html, /addEventListener\('toggle'[\s\S]{0,200}?true\)/);
+  // …re-applied after a re-render, and unchanged markup is left alone.
+  assert.match(html, /d\.open = openKeys\.has\(d\.dataset\.key\)/);
+  assert.match(html, /if \(el\.__html === html\) return;/);
+  // No caller may bypass setHTML for the panels that contain collapsibles.
+  for (const id of ['task', 'reports', 'git']) {
+    assert.match(html, new RegExp(`setHTML\\(document\\.getElementById\\('${id}'\\)`), `${id} must render via setHTML`);
+  }
+});
