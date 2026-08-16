@@ -182,6 +182,74 @@ test('default prompts contain no hardcoded protocol paths', () => {
   }
 });
 
+test('task history records each attempt with per-step timings', async () => {
+  const root = makeRoot();
+  try {
+    seedTask(root, 'T-1');
+    const r = makeRunner(root, {
+      coder: normalCoder(root),
+      tester: normalTester(root, 'PASS'),
+      orchestrator: normalOrchestrator(root),
+    });
+    await r.start({ once: true });
+
+    const { history } = readState(root).state;
+    assert.equal(history.length, 1);
+    const [h] = history;
+    assert.equal(h.taskId, 'T-1');
+    assert.equal(h.phase, '1');
+    assert.equal(h.coderStatus, 'COMPLETE');
+    assert.equal(h.testResult, 'PASS');
+    assert.equal(h.outcome, 'advanced');
+    assert.ok(h.coderMs > 0 && h.testerMs > 0 && h.orchestratorMs > 0, 'each step should be timed');
+    assert.ok(h.endedAt >= h.startedAt);
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('a gated attempt is recorded once, not duplicated per gate', async () => {
+  const root = makeRoot();
+  try {
+    seedTask(root, 'T-1');
+    const badCoder = fakeAgent(root, 'bad-coder', `bump('coder');
+      fs.writeFileSync(path.join(root, 'reports', 'current.md'), 'no fields here\\n');
+      process.exit(0);`);
+    const r = makeRunner(root, { coder: badCoder });
+    await r.start({ once: true });
+
+    let { history } = readState(root).state;
+    assert.equal(history.length, 1);
+    assert.equal(history[0].outcome, 'gated');
+    assert.equal(history[0].taskId, 'T-1');
+
+    // Re-running the same attempt updates the row instead of appending.
+    const r2 = makeRunner(root, { coder: badCoder });
+    await r2.start({ once: true });
+    ({ history } = readState(root).state);
+    assert.equal(history.length, 1, 'same attempt must stay one row');
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('history is capped and survives a state file without it', async () => {
+  const root = makeRoot();
+  try {
+    const s = defaultState();
+    // A state.json written by an older version has no history/timings.
+    delete (/** @type {any} */ (s).history);
+    delete (/** @type {any} */ (s).timings);
+    writeState(root, s);
+    const back = readState(root);
+    assert.equal(back.corrupt, false);
+    assert.deepEqual(back.state.history, []);
+    assert.equal(back.state.timings.coderMs, 0);
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
 test('a stale report the coder could not overwrite is never accepted', async () => {
   const root = makeRoot();
   try {

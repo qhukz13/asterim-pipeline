@@ -57,8 +57,19 @@ export function runAgent(role, agentCfg, prompt, projectRoot, hooks = {}) {
   return new Promise((resolve) => {
     /** @type {AgentResult} */
     const result = { code: null, timedOut: false, spawnError: null, pid: null, logFile };
+
     const out = fs.createWriteStream(logFile, { flags: 'a' });
     out.write(`# ${role} launched ${new Date().toISOString()}\n# command: ${agentCfg.command} ${args.join(' ')}\n\n`);
+
+    // Safety interlock for the test suite: a fixture that forgets to pin an
+    // agent would otherwise launch the real claude/agy on the developer's
+    // machine — with permission prompts skipped. Fail loudly instead.
+    if (process.env.ASTERIM_PIPELINE_BLOCK_REAL_AGENTS === '1' && agentCfg.command !== process.execPath) {
+      result.spawnError = `refused to launch "${agentCfg.command}": real agents are blocked in this environment (pin a fixture agent in the test config)`;
+      out.end(`\n# ${result.spawnError}\n`);
+      resolve(result);
+      return;
+    }
 
     /** @param {boolean} useShell */
     const doSpawn = (useShell) => {

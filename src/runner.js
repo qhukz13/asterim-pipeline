@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 import { PIPELINE_DIR } from './config.js';
 import { AGENT_STATES, assertTransition } from './state-machine.js';
 import { parseTaskFile, parseCoderReport, parseTestReport, parseTestSpec, sha256 } from './parse.js';
-import { readState, writeState } from './store.js';
+import { readState, writeState, HISTORY_LIMIT } from './store.js';
 import { FileWatcher } from './watch.js';
 import { runAgent, renderPrompt, pidAlive } from './agents.js';
 import { acquireLock, releaseLock, consumeControl } from './control.js';
@@ -45,15 +45,18 @@ function agentOutputDetail(res) {
 export class Runner extends EventEmitter {
   /**
    * @param {{root: string, config: import('./config.js').Config, logger: import('./logger.js').Logger,
-   *          remote?: import('./remote.js').RemoteExecutor|null}} opts
+   *          remote?: import('./remote.js').RemoteExecutor|null,
+   *          bus?: import('./output-bus.js').OutputBus|null}} opts
    */
-  constructor({ root, config, logger, remote = null }) {
+  constructor({ root, config, logger, remote = null, bus = null }) {
     super();
     this.root = root;
     this.cfg = config;
     this.log = logger;
     /** When set, coder/tester execution is dispatched to the LAN worker. */
     this.remote = remote;
+    /** Shared dashboard output feed, when a dashboard is being served. */
+    this.bus = bus;
     this.waitingForWorkerLogged = false;
     /** @type {import('./store.js').PersistedState} */
     this.st = readState(root).state;
@@ -106,6 +109,43 @@ export class Runner extends EventEmitter {
       testReportFile: this.cfg.files.testReport,
       ...extra,
     };
+  }
+
+  /**
+   * Fold the current task attempt into the history ring. Upserts on
+   * taskId+startedAt, so a task that gates and is then resumed stays one row
+   * whose outcome reflects how it actually ended.
+   * @param {string} outcome
+   */
+  recordHistory(outcome) {
+    const s = this.st;
+    if (s.taskId == null) return;
+    /** @type {import('./store.js').HistoryEntry} */
+    const entry = {
+      taskId: s.taskId,
+      phase: s.phase,
+      startedAt: s.startedAt,
+      endedAt: new Date().toISOString(),
+      coderStatus: s.lastCoderStatus,
+      testResult: s.lastTestResult,
+      coderMs: s.timings.coderMs,
+      testerMs: s.timings.testerMs,
+      orchestratorMs: s.timings.orchestratorMs,
+      outcome,
+    };
+    const last = s.history[s.history.length - 1];
+    if (last && last.taskId === entry.taskId && last.startedAt === entry.startedAt) {
+      s.history[s.history.length - 1] = entry;
+    } else {
+      s.history.push(entry);
+      if (s.history.length > HISTORY_LIMIT) s.history.splice(0, s.history.length - HISTORY_LIMIT);
+    }
+    this.save();
+  }
+
+  /** Zero the per-task timers when a new task begins. */
+  resetTimings() {
+    this.st.timings = { coderMs: 0, testerMs: 0, orchestratorMs: 0 };
   }
 
   /** @param {import('./state-machine.js').PipelineState} to */
@@ -434,6 +474,7 @@ export class Runner extends EventEmitter {
             s.phase = task.phase ?? s.phase;
             s.startedAt = new Date().toISOString();
             s.consecutiveBlocked = 0;
+            this.resetTimings();
             this.log.info(`new task detected: ${task.taskId}${task.phase ? ` (phase ${task.phase})` : ''}`);
             this.setState('TASK_READY');
           }
@@ -531,6 +572,13 @@ export class Runner extends EventEmitter {
    * @returns {Promise<import('./remote.js').RemoteAgentResult>}
    */
   async launch(role, prompt) {
+    this.bus?.mark(role, `${role} started for ${this.st.taskId ?? '?'}`);
+    const startedMs = Date.now();
+    /** Fold this run's duration into the current task's totals. */
+    const stopClock = () => {
+      this.st.timings[`${role}Ms`] += Date.now() - startedMs;
+      this.save();
+    };
     if (this.remote && (role === 'coder' || role === 'tester')) {
       this.agentAbort = new AbortController();
       this.log.info(`dispatching ${role} to worker ${this.remote.workerId()} (task ${this.st.taskId ?? '?'})`);
@@ -545,6 +593,7 @@ export class Runner extends EventEmitter {
         : res.remoteError ? `${role} failed on the worker: ${res.remoteError}`
         : `${role} finished on worker: code=${res.code}${res.timedOut ? ' (timed out)' : ''} committed=${res.committed} pushed=${res.pushed}`,
       );
+      stopClock();
       return res;
     }
     this.agentAbort = new AbortController();
@@ -555,14 +604,14 @@ export class Runner extends EventEmitter {
     // silent. It is captured to .pipeline/logs/ either way.
     let pending = '';
     const emit = (/** @type {string} */ line) => process.stdout.write(`  ${role} | ${line}\n`);
-    const onOutput = this.cfg.streamAgentOutput
-      ? (/** @type {Buffer} */ chunk) => {
-          pending += chunk.toString();
-          const lines = pending.split(/\r?\n/);
-          pending = lines.pop() ?? '';
-          for (const line of lines) emit(line);
-        }
-      : undefined;
+    const onOutput = (/** @type {Buffer} */ chunk) => {
+      this.bus?.append(role, chunk.toString());
+      if (!this.cfg.streamAgentOutput) return;
+      pending += chunk.toString();
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      for (const line of lines) emit(line);
+    };
     const res = await runAgent(role, agentCfg, prompt, this.root, {
       onSpawn: (pid) => {
         this.st[`${role}Pid`] = pid;
@@ -573,6 +622,8 @@ export class Runner extends EventEmitter {
       onOutput,
     });
     if (pending.trim() !== '') emit(pending);
+    this.bus?.flush(role);
+    stopClock();
     this.agentAbort = null;
     this.st[`${role}Pid`] = null;
     this.log.info(
@@ -832,10 +883,13 @@ export class Runner extends EventEmitter {
       this.phaseCompleteGate(task);
       return;
     }
+    // The previous attempt is finished the moment a next task is issued.
+    this.recordHistory('advanced');
     if (task.taskId !== s.taskId) s.consecutiveBlocked = 0;
     s.taskId = task.taskId;
     s.phase = task.phase ?? s.phase;
     s.startedAt = new Date().toISOString();
+    this.resetTimings();
     this.log.info(`orchestrator issued next task: ${task.taskId}`);
     this.setState('TASK_READY');
   }
@@ -848,6 +902,7 @@ export class Runner extends EventEmitter {
    */
   gate(reason, details = []) {
     const s = this.st;
+    this.recordHistory('gated');
     s.gateReason = reason;
     s.coderPid = s.testerPid = s.orchestratorPid = null;
     const from = s.state;
@@ -877,6 +932,7 @@ export class Runner extends EventEmitter {
       if (s.state !== 'IDLE') this.setState('IDLE');
       return;
     }
+    this.recordHistory('phase-complete');
     s.gateReason = `Phase ${phase} has completed.`;
     s.coderPid = s.testerPid = s.orchestratorPid = null;
     const from = s.state;

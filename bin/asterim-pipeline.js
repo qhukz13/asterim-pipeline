@@ -15,6 +15,7 @@ import { readLiveLock, writeControl, acquireLock, releaseLock } from '../src/con
 import { readState, writeState } from '../src/store.js';
 import { doctor, formatChecks } from '../src/doctor.js';
 import { OrchestratorServer } from '../src/server.js';
+import { OutputBus } from '../src/output-bus.js';
 import { RemoteExecutor } from '../src/remote.js';
 import { Worker } from '../src/worker.js';
 import { isRepo } from '../src/git.js';
@@ -239,6 +240,7 @@ async function orchestratorCmd(args) {
   }
   ensurePipelineGitignore(root);
   const token = ensureOrchestratorToken(root);
+  const bus = new OutputBus({ maxLines: config.remote.outputBufferLines });
   const server = new OrchestratorServer({
     root,
     remoteCfg: config.remote,
@@ -248,11 +250,12 @@ async function orchestratorCmd(args) {
     agentSummary: Object.fromEntries(
       Object.entries(config.agents).map(([role, a]) => [role, [a.command, ...a.args].join(' ')]),
     ),
+    bus,
   });
   const port = await server.listen();
   console.log(`dashboard: http://127.0.0.1:${port}/dashboard`);
   const remote = new RemoteExecutor(server, { root, cfg: config, logger });
-  const runner = new Runner({ root, config, logger, remote });
+  const runner = new Runner({ root, config, logger, remote, bus });
   try {
     const info = await runner.start({});
     return info.gated ? 3 : info.ok ? 0 : 1;
@@ -292,6 +295,7 @@ async function workerCmd(args) {
     root, host, port, token, workerId,
     agents: config.agents, files: config.files, logger,
     failureOutput: { enabled: config.remote.includeFailureOutput, chars: config.remote.failureOutputChars },
+    liveOutput: { enabled: config.remote.streamAgentOutputToOrchestrator, flushMs: config.remote.outputFlushMs },
   });
   const onSigint = () => {
     logger.info('[worker] shutting down');

@@ -24,6 +24,8 @@ import { randomUUID } from 'node:crypto';
 import { PIPELINE_DIR, DEFAULT_FILES } from './config.js';
 import { MSG, makeMsg, validateWorkerMessage, tokensEqual, isPrivateAddress, isLoopbackAddress } from './proto.js';
 import { dashboardData, dashboardHtml } from './dashboard.js';
+import { OutputBus } from './output-bus.js';
+import { writeControl } from './control.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 
@@ -40,10 +42,11 @@ export class OrchestratorServer extends EventEmitter {
    * @param {{root: string, remoteCfg: import('./config.js').Config['remote'],
    *          token: string, logger: import('./logger.js').Logger,
    *          files?: import('./config.js').Config['files'],
-   *          agentSummary?: Record<string, string>}} opts
-   *          files/agentSummary are used only by the read-only dashboard.
+   *          agentSummary?: Record<string, string>,
+   *          bus?: OutputBus}} opts
+   *          files/agentSummary/bus are used only by the dashboard.
    */
-  constructor({ root, remoteCfg, token, logger, files, agentSummary }) {
+  constructor({ root, remoteCfg, token, logger, files, agentSummary, bus }) {
     super();
     if (!token || token.length < 16) throw new Error('orchestrator token missing or too short');
     this.root = root;
@@ -52,6 +55,10 @@ export class OrchestratorServer extends EventEmitter {
     this.log = logger;
     this.files = files ?? { ...DEFAULT_FILES };
     this.agentSummary = agentSummary ?? {};
+    /** Shared live-output feed; also fed by locally-run agents. */
+    this.bus = bus ?? new OutputBus({ maxLines: remoteCfg.outputBufferLines });
+    /** Per-start token that authorizes dashboard control actions. */
+    this.controlToken = randomUUID();
     /** @type {WorkerInfo|null} */
     this.worker = null;
     /** @type {Pending|null} */
@@ -188,18 +195,61 @@ export class OrchestratorServer extends EventEmitter {
         this.respond(res, 403, { error: 'dashboard is available on the orchestrator machine only' });
         return;
       }
-      if (req.url === '/dashboard' || req.url === '/dashboard/') {
-        const html = dashboardHtml();
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      if (url.pathname === '/dashboard' || url.pathname === '/dashboard/') {
+        const html = dashboardHtml(this.controlToken);
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html) });
         res.end(html);
-      } else if (req.url === '/dashboard/data') {
+      } else if (url.pathname === '/dashboard/data') {
         this.respond(res, 200, dashboardData(this.root, this.files, {
           agents: this.agentSummary,
           port: /** @type {import('node:net').AddressInfo|null} */ (this.server?.address() ?? null)?.port ?? null,
         }));
+      } else if (url.pathname === '/dashboard/output') {
+        const since = Number(url.searchParams.get('since') ?? '0');
+        this.respond(res, 200, this.bus.since(Number.isFinite(since) ? since : 0));
       } else {
         this.respond(res, 404, { error: 'unknown endpoint' });
       }
+      return;
+    }
+
+    // Dashboard control actions: loopback only, and authorized by a token
+    // that is only ever handed to the local page (a cross-origin page cannot
+    // read our HTML, so it cannot obtain it).
+    if (req.method === 'POST' && (req.url ?? '').startsWith('/dashboard/control')) {
+      if (!isLoopbackAddress(addr)) {
+        this.respond(res, 403, { error: 'controls are available on the orchestrator machine only' });
+        return;
+      }
+      const site = String(req.headers['sec-fetch-site'] ?? 'same-origin');
+      if (site !== 'same-origin' && site !== 'none') {
+        this.respond(res, 403, { error: 'cross-site control requests are refused' });
+        return;
+      }
+      /** @type {Record<string, any>} */
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (err) {
+        this.respond(res, 400, { error: /** @type {Error} */ (err).message });
+        return;
+      }
+      if (typeof body?.controlToken !== 'string' || !tokensEqual(body.controlToken, this.controlToken)) {
+        this.log.warn('[orchestrator] rejected dashboard control with a bad token');
+        this.respond(res, 401, { error: 'invalid control token' });
+        return;
+      }
+      const action = body.action;
+      if (action !== 'pause' && action !== 'resume' && action !== 'stop') {
+        this.respond(res, 400, { error: `unknown action ${String(action)}` });
+        return;
+      }
+      // Same channel the CLI uses, so both have identical semantics.
+      writeControl(this.root, action);
+      this.log.info(`[orchestrator] dashboard requested ${action}`);
+      this.emit('control', action);
+      this.respond(res, 200, { ok: true, action });
       return;
     }
     const auth = req.headers.authorization ?? '';
@@ -238,6 +288,9 @@ export class OrchestratorServer extends EventEmitter {
         return;
       case '/v1/heartbeat':
         this.handleHeartbeat(msg, res);
+        return;
+      case '/v1/output':
+        this.handleOutput(msg, res);
         return;
       case '/v1/result':
         this.handleResult(msg, res);
@@ -355,6 +408,18 @@ export class OrchestratorServer extends EventEmitter {
       this.waitingPoll = null;
       this.respond(wp.res, 200, out);
     }
+  }
+
+  /** @param {Record<string, any>} msg @param {http.ServerResponse} res */
+  handleOutput(msg, res) {
+    if (!this.checkSession(msg, res)) return;
+    this.touch();
+    if (msg.type !== MSG.AGENT_OUTPUT) {
+      this.respond(res, 400, { error: `unexpected type ${msg.type} on /v1/output` });
+      return;
+    }
+    this.bus.append(String(msg.role), String(msg.chunk));
+    this.respond(res, 200, makeMsg(MSG.ACK));
   }
 
   /** @param {Record<string, any>} msg @param {http.ServerResponse} res */

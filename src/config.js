@@ -88,7 +88,8 @@ export const DEFAULT_FILES = {
  *   remote: {bind: string, port: number, heartbeatIntervalMs: number, heartbeatTimeoutMs: number,
  *            pollTimeoutMs: number, redeliverMs: number, dispatchGraceMinutes: number,
  *            allowPublicClients: boolean, autoCommitTaskFiles: boolean,
- *            includeFailureOutput: boolean, failureOutputChars: number},
+ *            includeFailureOutput: boolean, failureOutputChars: number,
+ *            streamAgentOutputToOrchestrator: boolean, outputFlushMs: number, outputBufferLines: number},
  *   prompts: {coder: string, tester: string, orchestrator: string},
  *   files: {task: string, coderReport: string, testSpec: string, testReport: string},
  * }} Config
@@ -100,7 +101,10 @@ function agentDefaults(command, over = {}) {
     command,
     // "-p" puts claude CLI into non-interactive print mode; the prompt itself
     // is piped via stdin to avoid shell-quoting problems on Windows.
-    args: ['-p'],
+    // stream-json makes progress visible while the agent works (plain -p
+    // prints almost everything only at the end); the pipeline never parses
+    // agent stdout, so the format is purely for humans watching.
+    args: ['-p', '--verbose', '--output-format', 'stream-json'],
     promptVia: 'stdin',
     timeoutMinutes: 60,
     ...over,
@@ -155,6 +159,13 @@ export function defaultConfig(projectRoot) {
       // to keep every byte of agent output on the machine that produced it.
       includeFailureOutput: true,
       failureOutputChars: 2000,
+      // Live agent output for the dashboard feed. This sends agent stdout
+      // across the LAN while a run is in progress; set false to keep every
+      // byte on the machine that produced it (gates still work, you just
+      // watch the worker's own terminal instead).
+      streamAgentOutputToOrchestrator: true,
+      outputFlushMs: 500,
+      outputBufferLines: 2000,
     },
     prompts: { ...DEFAULT_PROMPTS },
     files: { ...DEFAULT_FILES },
@@ -204,11 +215,13 @@ export function mergeConfig(projectRoot, raw) {
     if (typeof raw.remote.bind === 'string' && raw.remote.bind.trim() !== '') cfg.remote.bind = raw.remote.bind;
     for (const key of /** @type {const} */ ([
       'port', 'heartbeatIntervalMs', 'heartbeatTimeoutMs', 'pollTimeoutMs', 'redeliverMs', 'dispatchGraceMinutes',
-      'failureOutputChars',
+      'failureOutputChars', 'outputFlushMs', 'outputBufferLines',
     ])) {
       if (typeof raw.remote[key] === 'number' && raw.remote[key] >= 0) cfg.remote[key] = raw.remote[key];
     }
-    for (const key of /** @type {const} */ (['allowPublicClients', 'autoCommitTaskFiles', 'includeFailureOutput'])) {
+    for (const key of /** @type {const} */ ([
+      'allowPublicClients', 'autoCommitTaskFiles', 'includeFailureOutput', 'streamAgentOutputToOrchestrator',
+    ])) {
       if (typeof raw.remote[key] === 'boolean') cfg.remote[key] = raw.remote[key];
     }
   }

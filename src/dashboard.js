@@ -5,8 +5,12 @@
 
 export { dashboardData } from './dashboard-data.js';
 
-/** The single-page dashboard. Self-contained: no external assets. */
-export function dashboardHtml() {
+/**
+ * The single-page dashboard. Self-contained: no external assets.
+ * @param {string} [controlToken] authorizes pause/resume/stop from the page;
+ *   it is only ever served to loopback, so a cross-origin page cannot read it.
+ */
+export function dashboardHtml(controlToken = '') {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -111,6 +115,25 @@ export function dashboardHtml() {
   button:hover { color: var(--fg); border-color: var(--line-hover); background: var(--panel-2); }
   button:active { transform: scale(.98); }
   .stamp { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ctrls { display: inline-flex; gap: 6px; }
+  button.danger:hover { color: var(--err); border-color: rgba(239,68,68,.5); background: var(--err-bg); }
+  button.on { color: var(--accent); border-color: var(--accent); background: var(--accent-subtle); }
+  button:disabled { opacity: .45; cursor: default; }
+  .tabs { display: inline-flex; gap: 4px; margin-left: 12px; }
+  button.tab { height: 22px; padding: 0 8px; font-size: 11px; text-transform: none; letter-spacing: 0; }
+  .toast { position: fixed; right: 20px; bottom: 20px; z-index: 2000; background: var(--panel-3);
+           border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px;
+           box-shadow: var(--shadow-md); font-size: 13.5px; display: none; }
+  /* live output feed */
+  #out { max-height: 46vh; }
+  .o-role { color: var(--dim); }
+  .o-coder { color: var(--accent); }
+  .o-tester { color: var(--wait); }
+  .o-orchestrator { color: var(--warn); }
+  .o-mark { color: var(--fg-soft); font-weight: 600; }
+  .o-tool { color: var(--fg); }
+  .o-bad { color: var(--err); }
+  .o-good { color: var(--ok); }
 
   /* ---- gate banner ------------------------------------------------------ */
   .gate {
@@ -142,6 +165,7 @@ export function dashboardHtml() {
   .panel > h2 {
     font-size: 12px; letter-spacing: .06em; color: var(--dim); text-transform: uppercase;
     font-weight: 600; margin: 0; padding: 10px 16px; border-bottom: 1px solid var(--line-subtle);
+    display: flex; align-items: center;
   }
   .panel .body { padding: 16px; }
   .panel + .panel { margin-top: 16px; }
@@ -179,7 +203,10 @@ export function dashboardHtml() {
   #log { max-height: 38vh; }
 
   /* ---- tables / lists ---------------------------------------------------- */
+  /* Wide tables scroll inside their panel rather than widening the page. */
+  .tablewrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  #history td, #history th { white-space: nowrap; }
   th { text-align: left; color: var(--dim); font-size: 12px; text-transform: uppercase;
        letter-spacing: .06em; font-weight: 600; padding: 0 10px 6px 0; }
   td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line-subtle);
@@ -219,6 +246,11 @@ export function dashboardHtml() {
     <span class="pill" id="pill"><span class="dot"></span><span id="pill-text">…</span></span>
     <span class="rootpath" id="root"></span>
     <span class="spacer"></span>
+    <span class="ctrls">
+      <button id="c-pause" title="Finish the running agent, then hold">Pause</button>
+      <button id="c-resume" title="Clear a pause, or acknowledge a gate after review">Resume</button>
+      <button id="c-stop" class="danger" title="Stop the pipeline (kills a running agent)">Stop</button>
+    </span>
     <button id="notify">enable alerts</button>
     <span class="stamp" id="updated"></span>
   </div>
@@ -260,7 +292,25 @@ export function dashboardHtml() {
   </div>
 
   <div class="panel">
-    <h2>Log</h2>
+    <h2>Live agent output
+      <span class="tabs" id="out-tabs">
+        <button data-role="" class="tab on">all</button>
+        <button data-role="coder" class="tab">coder</button>
+        <button data-role="tester" class="tab">tester</button>
+        <button data-role="orchestrator" class="tab">orchestrator</button>
+        <button id="freeze" class="tab">freeze</button>
+      </span>
+    </h2>
+    <div class="body"><pre id="out">waiting for agent output…</pre></div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent tasks</h2>
+    <div class="body" id="history"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Pipeline log</h2>
     <div class="body"><pre id="log">loading…</pre></div>
   </div>
 </div>
@@ -353,6 +403,98 @@ function colorize(line) {
   return '<span class="' + cls + '">' + h + '</span>';
 }
 
+/* ---- controls ---------------------------------------------------------- */
+const CONTROL_TOKEN = ${JSON.stringify(controlToken)};
+const toast = (() => {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  document.body.appendChild(el);
+  let t = null;
+  return (msg) => {
+    el.textContent = msg;
+    el.style.display = 'block';
+    clearTimeout(t);
+    t = setTimeout(() => { el.style.display = 'none'; }, 4000);
+  };
+})();
+
+async function control(action) {
+  if (action === 'stop' && !confirm('Stop the pipeline? A running agent will be killed and the task left unfinished.')) return;
+  try {
+    const r = await fetch('/dashboard/control', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action, controlToken: CONTROL_TOKEN }),
+    });
+    const body = await r.json().catch(() => ({}));
+    toast(r.ok ? action + ' sent to the pipeline' : 'failed: ' + (body.error || r.status));
+  } catch (e) {
+    toast('control request failed — is the orchestrator still running?');
+  }
+}
+document.getElementById('c-pause').onclick = () => control('pause');
+document.getElementById('c-resume').onclick = () => control('resume');
+document.getElementById('c-stop').onclick = () => control('stop');
+
+/* ---- live agent output -------------------------------------------------- */
+let outCursor = 0, outLines = [], outRole = '', frozen = false;
+const OUT_MAX = 1200;
+const outEl = document.getElementById('out');
+
+for (const b of document.querySelectorAll('#out-tabs .tab[data-role]')) {
+  b.onclick = () => {
+    outRole = b.dataset.role;
+    for (const o of document.querySelectorAll('#out-tabs .tab[data-role]')) o.classList.toggle('on', o === b);
+    renderOutput(true);
+  };
+}
+const freezeBtn = document.getElementById('freeze');
+freezeBtn.onclick = () => {
+  frozen = !frozen;
+  freezeBtn.classList.toggle('on', frozen);
+  freezeBtn.textContent = frozen ? 'frozen' : 'freeze';
+};
+
+function classifyOutput(text) {
+  if (text.startsWith('—')) return 'o-mark';
+  if (text.startsWith('▸')) return 'o-tool';
+  if (text.startsWith('✗') || text.includes('✗') || text.startsWith('⚠')) return 'o-bad';
+  if (text.startsWith('✓')) return 'o-good';
+  return '';
+}
+
+function renderOutput(force) {
+  const shown = outRole ? outLines.filter((l) => l.role === outRole) : outLines;
+  const html = shown.length
+    ? shown.map((l) => {
+        const t = new Date(l.at).toLocaleTimeString();
+        return '<span class="ts">' + esc(t) + '</span> <span class="o-role o-' + esc(l.role) + '">' +
+          esc(l.role.padEnd(12).slice(0, 12)) + '</span> <span class="' + classifyOutput(l.text) + '">' + esc(l.text) + '</span>';
+      }).join('\\n')
+    : 'waiting for agent output…';
+  if (outEl.__html === html && !force) return;
+  const atBottom = outEl.scrollTop + outEl.clientHeight >= outEl.scrollHeight - 20;
+  outEl.__html = html;
+  outEl.innerHTML = html;
+  if (atBottom || force) outEl.scrollTop = outEl.scrollHeight;
+}
+
+async function pollOutput() {
+  if (frozen) return;
+  try {
+    const d = await (await fetch('/dashboard/output?since=' + outCursor)).json();
+    if (d.dropped) outLines = []; // cursor fell off the ring; resync
+    if (d.lines.length) {
+      outLines.push(...d.lines);
+      if (outLines.length > OUT_MAX) outLines.splice(0, outLines.length - OUT_MAX);
+    }
+    outCursor = d.cursor;
+    if (d.lines.length || d.dropped) renderOutput(false);
+  } catch {
+    /* the main tick already reports unreachability */
+  }
+}
+
 let lastGate = null, notifyOn = false;
 const notifyBtn = document.getElementById('notify');
 notifyBtn.onclick = async () => {
@@ -362,6 +504,7 @@ notifyBtn.onclick = async () => {
 };
 
 async function tick() {
+  if (frozen) return;
   let d;
   try {
     d = await (await fetch('/dashboard/data')).json();
@@ -393,9 +536,13 @@ async function tick() {
   const gate = document.getElementById('gate');
   if (st.gateReason) {
     gate.style.display = 'flex';
-    setHTML(gate, '<div><strong>Human review required</strong>' +
+    setHTML(gate, '<div style="flex:1"><strong>Human review required</strong>' +
       '<div class="why">' + esc(st.gateReason) + '</div>' +
-      '<div class="muted" style="margin-top:.4rem">Review, then run <code>asterim-pipeline resume</code></div></div>');
+      '<div class="muted" style="margin-top:6px">Review the reports, then resume — ' +
+      'or run <code>asterim-pipeline resume</code></div>' +
+      '<button id="gate-resume" style="margin-top:10px">Resume pipeline</button></div>');
+    const gr = document.getElementById('gate-resume');
+    if (gr) gr.onclick = () => control('resume');
     if (notifyOn && st.gateReason !== lastGate) {
       new Notification('asterim-pipeline — human review required', { body: st.gateReason });
     }
@@ -424,11 +571,11 @@ async function tick() {
     : '<li class="muted">No transitions recorded yet.</li>');
 
   setHTML(document.getElementById('workers'), d.workers.length
-    ? '<table><thead><tr><th>Worker</th><th>Status</th><th>Agent</th><th>Seen</th></tr></thead><tbody>' +
+    ? '<div class="tablewrap"><table><thead><tr><th>Worker</th><th>Status</th><th>Agent</th><th>Seen</th></tr></thead><tbody>' +
       d.workers.map((w) => '<tr><td class="mono">' + esc(w.workerId) + '</td>' +
         '<td class="' + (w.online ? 'online' : 'offline') + '">' + (w.online ? 'ONLINE' : 'OFFLINE') + '</td>' +
         '<td>' + esc(w.currentAgent) + '</td><td class="muted">' + ago(w.lastSeenAt) + '</td></tr>').join('') +
-      '</tbody></table>'
+      '</tbody></table></div>'
     : '<div class="muted">No workers registered.</div>');
 
   setHTML(document.getElementById('git'), d.git
@@ -448,6 +595,22 @@ async function tick() {
     Object.entries(cfg.files).map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') +
     '</dl>');
 
+  const hist = Array.isArray(st.history) ? st.history.slice().reverse() : [];
+  setHTML(document.getElementById('history'), hist.length
+    ? '<div class="tablewrap"><table><thead><tr><th>Task</th><th>Phase</th><th>Coder</th><th>Tests</th>' +
+      '<th>Coder</th><th>Tester</th><th>Orch</th><th>Outcome</th></tr></thead><tbody>' +
+      hist.map((h) => '<tr>' +
+        '<td class="mono">' + esc(h.taskId) + '</td>' +
+        '<td>' + esc(h.phase) + '</td>' +
+        '<td>' + esc(h.coderStatus) + '</td>' +
+        '<td class="' + (h.testResult === 'PASS' ? 'pass' : h.testResult === 'FAIL' ? 'fail' : '') + '">' + esc(h.testResult) + '</td>' +
+        '<td>' + esc(h.coderMs ? dur(h.coderMs) : '—') + '</td>' +
+        '<td>' + esc(h.testerMs ? dur(h.testerMs) : '—') + '</td>' +
+        '<td>' + esc(h.orchestratorMs ? dur(h.orchestratorMs) : '—') + '</td>' +
+        '<td class="muted">' + esc(h.outcome) + '</td></tr>').join('') +
+      '</tbody></table></div>'
+    : '<div class="muted">No completed tasks recorded yet.</div>');
+
   const logEl = document.getElementById('log');
   const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 16;
   const logHtml = d.log.map(colorize).join('\\n') || '(log empty)';
@@ -460,7 +623,9 @@ async function tick() {
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 tick();
+pollOutput();
 setInterval(tick, 2000);
+setInterval(pollOutput, 1000); // output polls faster: it is the "live" bit
 </script>
 </body>
 </html>

@@ -16,6 +16,7 @@
 
 import { MSG, makeMsg, capReport } from './proto.js';
 import { parseTaskFile, sha256 } from './parse.js';
+import { formatAgentOutput } from './agent-stream.js';
 import { runAgent, killTree } from './agents.js';
 import * as gitx from './git.js';
 import fs from 'node:fs';
@@ -32,9 +33,10 @@ export class Worker {
    *          agents: import('./config.js').Config['agents'],
    *          files: import('./config.js').Config['files'],
    *          logger: import('./logger.js').Logger,
-   *          failureOutput?: {enabled: boolean, chars: number}}} opts
+   *          failureOutput?: {enabled: boolean, chars: number},
+   *          liveOutput?: {enabled: boolean, flushMs: number}}} opts
    */
-  constructor({ root, host, port, token, workerId, agents, files, logger, failureOutput }) {
+  constructor({ root, host, port, token, workerId, agents, files, logger, failureOutput, liveOutput }) {
     this.root = root;
     this.base = `http://${host}:${port}`;
     this.token = token;
@@ -44,6 +46,13 @@ export class Worker {
     this.log = logger;
     /** On failure only: how much agent output may be sent back (0 = none). */
     this.failureOutputChars = failureOutput?.enabled === false ? 0 : (failureOutput?.chars ?? 2000);
+    /** Live output streaming to the orchestrator's dashboard feed. */
+    this.liveOutput = liveOutput?.enabled !== false;
+    this.liveFlushMs = liveOutput?.flushMs ?? 500;
+    /** @type {string} */
+    this.outBuf = '';
+    /** @type {NodeJS.Timeout|null} */
+    this.outTimer = null;
     /** @type {string|null} */
     this.sessionId = null;
     this.heartbeatIntervalMs = 10000;
@@ -324,10 +333,14 @@ export class Worker {
         if (this.current) this.current.pid = pid;
         this.log.info(`[worker] [${role}] running (pid ${pid})`);
       },
-      // Stream the agent's output live to the worker terminal (it is also
-      // captured to .pipeline/logs/<role>-*.log). Stays on this machine.
-      onOutput: (chunk) => process.stdout.write(chunk),
+      // Stream to this terminal, and (unless disabled) to the orchestrator
+      // dashboard. Always captured to .pipeline/logs/<role>-*.log as well.
+      onOutput: (chunk) => {
+        process.stdout.write(chunk);
+        this.queueOutput(role, chunk.toString());
+      },
     });
+    await this.flushOutput(role);
     if (this.current) this.current.pid = null;
     this.log.info(
       res.spawnError
@@ -413,6 +426,41 @@ export class Worker {
   }
 
   /**
+   * Queue agent output for the orchestrator's dashboard feed. Batched: a
+   * chatty agent must not turn into one HTTP request per write.
+   * @param {string} role
+   * @param {string} text
+   */
+  queueOutput(role, text) {
+    if (!this.liveOutput || this.sessionId == null) return;
+    this.outBuf += text;
+    if (this.outBuf.length >= 4096) {
+      void this.flushOutput(role);
+      return;
+    }
+    if (this.outTimer == null) {
+      this.outTimer = setTimeout(() => void this.flushOutput(role), this.liveFlushMs);
+      this.outTimer.unref?.();
+    }
+  }
+
+  /** @param {string} role */
+  async flushOutput(role) {
+    if (this.outTimer) {
+      clearTimeout(this.outTimer);
+      this.outTimer = null;
+    }
+    const chunk = this.outBuf;
+    this.outBuf = '';
+    if (chunk === '' || !this.liveOutput) return;
+    try {
+      await this.request('/v1/output', makeMsg(MSG.AGENT_OUTPUT, this.envelope({ role, chunk })), 8000);
+    } catch {
+      // Observability only: dropping live output must never affect the run.
+    }
+  }
+
+  /**
    * Tail of an agent log, for FAILED runs only. Successful runs never send
    * output anywhere; this is bounded and can be disabled entirely with
    * remote.includeFailureOutput = false.
@@ -422,7 +470,9 @@ export class Worker {
   tailOf(logFile) {
     if (this.failureOutputChars <= 0) return null;
     try {
-      const text = fs.readFileSync(logFile, 'utf8');
+      // Render stream-json into readable lines first, otherwise a gate would
+      // quote raw JSON at the human.
+      const text = formatAgentOutput(fs.readFileSync(logFile, 'utf8'));
       const trimmed = text.length > this.failureOutputChars ? text.slice(-this.failureOutputChars) : text;
       return trimmed.trim() === '' ? null : (text.length > this.failureOutputChars ? '…' : '') + trimmed;
     } catch {

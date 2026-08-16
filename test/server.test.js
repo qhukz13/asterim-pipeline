@@ -7,6 +7,7 @@ import path from 'node:path';
 import { OrchestratorServer } from '../src/server.js';
 import { makeMsg, MSG } from '../src/proto.js';
 import { createLogger } from '../src/logger.js';
+import { consumeControl } from '../src/control.js';
 import { makeRoot, cleanupRoot, sleep, waitFor } from './helpers.js';
 
 const TOKEN = 'test-token-0123456789abcdef';
@@ -232,6 +233,100 @@ test('server: dashboard is served to loopback without a token; POST endpoints st
     // command endpoints remain token-protected
     const unauth = await fetch(`http://127.0.0.1:${port}/v1/register`, { method: 'POST', body: '{}' });
     assert.equal(unauth.status, 401);
+  } finally {
+    server.close();
+    cleanupRoot(root);
+  }
+});
+
+test('server: worker output reaches the dashboard feed, formatted, with a cursor', async () => {
+  const root = makeRoot();
+  const { server, port } = await startServer(root);
+  try {
+    const sessionId = await register(port);
+    const send = (chunk) => post(port, '/v1/output', makeMsg(MSG.AGENT_OUTPUT, { workerId: 'laptop-01', sessionId, role: 'coder', chunk }));
+
+    // A stream-json event split across two chunks must still render once.
+    await send('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_p');
+    let feed = await (await fetch(`http://127.0.0.1:${port}/dashboard/output?since=0`)).json();
+    assert.equal(feed.lines.length, 0, 'a partial line must not be published');
+
+    await send('ath":"src/app.ts"}}]}}\n');
+    feed = await (await fetch(`http://127.0.0.1:${port}/dashboard/output?since=0`)).json();
+    assert.equal(feed.lines.length, 1);
+    assert.equal(feed.lines[0].role, 'coder');
+    assert.equal(feed.lines[0].text, '▸ Edit  src/app.ts');
+
+    // The cursor returns only what is new.
+    const after = await (await fetch(`http://127.0.0.1:${port}/dashboard/output?since=${feed.cursor}`)).json();
+    assert.equal(after.lines.length, 0);
+    await send('plain text line\n');
+    const more = await (await fetch(`http://127.0.0.1:${port}/dashboard/output?since=${feed.cursor}`)).json();
+    assert.deepEqual(more.lines.map((l) => l.text), ['plain text line']);
+  } finally {
+    server.close();
+    cleanupRoot(root);
+  }
+});
+
+test('server: /v1/output rejects unauthenticated and stale-session senders', async () => {
+  const root = makeRoot();
+  const { server, port } = await startServer(root);
+  try {
+    const sessionId = await register(port);
+    const bad = await post(port, '/v1/output', makeMsg(MSG.AGENT_OUTPUT, { workerId: 'laptop-01', sessionId, role: 'coder', chunk: 'x\n' }), 'wrong-token');
+    assert.equal(bad.status, 401);
+    const stale = await post(port, '/v1/output', makeMsg(MSG.AGENT_OUTPUT, { workerId: 'laptop-01', sessionId: 'nope', role: 'coder', chunk: 'x\n' }));
+    assert.equal(stale.status, 403);
+    const malformed = await post(port, '/v1/output', makeMsg(MSG.AGENT_OUTPUT, { workerId: 'laptop-01', sessionId }));
+    assert.equal(malformed.status, 400); // missing role/chunk
+    const feed = await (await fetch(`http://127.0.0.1:${port}/dashboard/output?since=0`)).json();
+    assert.equal(feed.lines.length, 0, 'nothing rejected may reach the feed');
+  } finally {
+    server.close();
+    cleanupRoot(root);
+  }
+});
+
+test('server: dashboard control requires the token and writes the control file', async () => {
+  const root = makeRoot();
+  const { server, port } = await startServer(root);
+  try {
+    const controlUrl = `http://127.0.0.1:${port}/dashboard/control`;
+    const send = (body, headers = {}) => fetch(controlUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    });
+
+    // No token, wrong token, unknown action: all refused, nothing written.
+    assert.equal((await send({ action: 'pause' })).status, 401);
+    assert.equal((await send({ action: 'pause', controlToken: 'guess' })).status, 401);
+    assert.equal((await send({ action: 'launch-missiles', controlToken: server.controlToken })).status, 400);
+    assert.equal(consumeControl(root), null);
+
+    // A cross-site request is refused even with a valid token.
+    const crossSite = await send({ action: 'stop', controlToken: server.controlToken }, { 'sec-fetch-site': 'cross-site' });
+    assert.equal(crossSite.status, 403);
+    assert.equal(consumeControl(root), null);
+
+    // The real thing goes through the same channel the CLI uses.
+    const ok = await send({ action: 'pause', controlToken: server.controlToken });
+    assert.equal(ok.status, 200);
+    assert.equal(consumeControl(root), 'pause');
+  } finally {
+    server.close();
+    cleanupRoot(root);
+  }
+});
+
+test('server: the dashboard page carries the control token', async () => {
+  const root = makeRoot();
+  const { server, port } = await startServer(root);
+  try {
+    const html = await (await fetch(`http://127.0.0.1:${port}/dashboard`)).text();
+    assert.ok(html.includes(server.controlToken), 'the local page needs the token to act');
+    assert.ok(server.controlToken.length >= 32);
   } finally {
     server.close();
     cleanupRoot(root);

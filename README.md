@@ -395,18 +395,50 @@ asterim-pipeline workers   # Worker ID / Status / Agent / Task / Last seen
 asterim-pipeline status    # includes Root: and a Worker: line in distributed mode
 ```
 
-**Dashboard**: the orchestrator serves a read-only live dashboard at
-`http://127.0.0.1:<port>/dashboard` (URL printed at startup) — state, task,
-gate banner, worker table, and a live log tail, refreshing every 2 s. It is
-served **only to the orchestrator machine itself** (loopback), needs no
-token, and never contains agent transcripts. To view it from another machine,
-tunnel it: `ssh -L 4317:localhost:4317 <pc>`.
+**Dashboard**: the orchestrator serves a live dashboard at
+`http://127.0.0.1:<port>/dashboard` (URL printed at startup), refreshing
+every 2 s. It is served **only to the orchestrator machine itself**
+(loopback). To view it from another machine, tunnel it:
+`ssh -L 4317:localhost:4317 <pc>`. It shows:
 
-**Watching Claude on the worker**: the worker streams the coder/tester
-stdout/stderr live into its own terminal (and always captures it to
-`.pipeline/logs/<role>-*.log` on the laptop). Transcripts never leave the
-machine that ran the agent. Note that `claude -p` prints its result when it
-finishes, so long silences during a run are normal.
+- current state, elapsed time, task summary with acceptance criteria
+- a gate banner with the reason and a **Resume** button
+- **live agent output** from all three agents (below)
+- **recent tasks** with per-step timings, so a runaway session is obvious
+- workers, repository head, configuration, and the pipeline log
+
+**Live agent output.** Agents run with
+`--verbose --output-format stream-json`, and the pipeline renders those
+events as readable lines:
+
+```
+14:02:19  coder   ▸ Edit  packages/adapters/src/sdk/BaseAdapter.ts
+14:02:26  coder   ▸ Bash  pnpm typecheck
+14:02:41  coder     ✗ error TS2554: Expected 0 arguments, but got 1.
+14:05:03  coder   ✓ finished — 3m 04s · 37 turns · $1.42
+14:05:04  coder   ⚠ permission denied: Write
+```
+
+Filter by role, or **freeze** the panel to read without it moving. The
+pipeline never parses agent stdout — reports remain the only protocol — so
+the format is purely for humans and unknown events pass through verbatim.
+
+In distributed mode the worker batches this output and posts it to the
+orchestrator (`AGENT_OUTPUT`, ~500 ms or 4 KB per request), where it lives in
+a memory-only ring buffer that is never written to `state.json` or the log.
+Set `remote.streamAgentOutputToOrchestrator: false` on the worker to keep
+every byte on the machine that produced it; the full transcript is always in
+`.pipeline/logs/<role>-*.log` there regardless.
+
+**Controls.** Pause, Resume and Stop buttons write the same
+`.pipeline/control.json` the CLI uses, so browser and terminal have identical
+semantics and the state machine is untouched. They are authorized by a token
+generated per orchestrator start and embedded in the page — a page on another
+origin cannot read our HTML, so it cannot obtain the token — and additionally
+restricted to loopback with a `Sec-Fetch-Site` check. Stop asks for
+confirmation, since it kills a running agent. The worker *process* lifecycle
+stays manual: Pause and Stop reach it over the protocol, but nothing can
+start a process that is not running.
 
 Note: `status`/`workers` read `.pipeline/` under the **current directory** —
 run them from the project root or pass `--root`; the `Root:` line shows which
@@ -425,6 +457,17 @@ directory was actually inspected.
 | `dispatchGraceMinutes` | `5` | added to the agent timeout for the dispatch timeout |
 | `allowPublicClients` | `false` | accept non-LAN client addresses (leave off) |
 | `autoCommitTaskFiles` | `true` | pipeline commits+pushes the task files before dispatch |
+| `includeFailureOutput` | `true` | on failed runs only, return the agent's last output for the gate |
+| `failureOutputChars` | `2000` | cap for that failure tail |
+| `streamAgentOutputToOrchestrator` | `true` | live agent output for the dashboard feed |
+| `outputFlushMs` | `500` | how often the worker batches output |
+| `outputBufferLines` | `2000` | ring-buffer size on the orchestrator |
+
+**Upgrading an existing worker:** the coder/tester defaults are now
+`-p --verbose --output-format stream-json`. If the laptop's
+`.pipeline/config.json` pins `args` explicitly, update it by hand or delete
+the `args` key to pick up the default — otherwise output stays batched to the
+end of the run and the live panel will look idle.
 
 ## Development
 

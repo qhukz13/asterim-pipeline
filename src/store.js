@@ -25,8 +25,20 @@ import { PIPELINE_DIR } from './config.js';
  *   lastCoderStatus: string|null,
  *   lastTestResult: string|null,
  *   preCoderHeadSha: string|null,
+ *   timings: {coderMs: number, testerMs: number, orchestratorMs: number},
+ *   history: HistoryEntry[],
  * }} PersistedState
+ *
+ * @typedef {{
+ *   taskId: string|null, phase: string|null, startedAt: string|null, endedAt: string|null,
+ *   coderStatus: string|null, testResult: string|null,
+ *   coderMs: number, testerMs: number, orchestratorMs: number,
+ *   outcome: string,
+ * }} HistoryEntry
  */
+
+/** Most recent task attempts kept in state.json. */
+export const HISTORY_LIMIT = 20;
 
 /** @returns {PersistedState} */
 export function defaultState() {
@@ -49,6 +61,8 @@ export function defaultState() {
     lastCoderStatus: null,
     lastTestResult: null,
     preCoderHeadSha: null,
+    timings: { coderMs: 0, testerMs: 0, orchestratorMs: 0 },
+    history: [],
   };
 }
 
@@ -72,7 +86,18 @@ export function readState(projectRoot) {
     if (raw === null || typeof raw !== 'object' || typeof raw.state !== 'string') {
       return { state: defaultState(), existed: true, corrupt: true };
     }
-    return { state: { ...defaultState(), ...raw, hashes: { ...defaultState().hashes, ...(raw.hashes ?? {}) } }, existed: true, corrupt: false };
+    const base = defaultState();
+    return {
+      state: {
+        ...base,
+        ...raw,
+        hashes: { ...base.hashes, ...(raw.hashes ?? {}) },
+        timings: { ...base.timings, ...(raw.timings ?? {}) },
+        history: Array.isArray(raw.history) ? raw.history : [],
+      },
+      existed: true,
+      corrupt: false,
+    };
   } catch {
     return { state: defaultState(), existed: true, corrupt: true };
   }
