@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { PIPELINE_DIR } from './config.js';
+import { PIPELINE_DIR, DEFAULT_FILES } from './config.js';
 import { MSG, makeMsg, validateWorkerMessage, tokensEqual, isPrivateAddress, isLoopbackAddress } from './proto.js';
 import { dashboardData, dashboardHtml } from './dashboard.js';
 
@@ -38,15 +38,20 @@ const MAX_BODY_BYTES = 1024 * 1024;
 export class OrchestratorServer extends EventEmitter {
   /**
    * @param {{root: string, remoteCfg: import('./config.js').Config['remote'],
-   *          token: string, logger: import('./logger.js').Logger}} opts
+   *          token: string, logger: import('./logger.js').Logger,
+   *          files?: import('./config.js').Config['files'],
+   *          agentSummary?: Record<string, string>}} opts
+   *          files/agentSummary are used only by the read-only dashboard.
    */
-  constructor({ root, remoteCfg, token, logger }) {
+  constructor({ root, remoteCfg, token, logger, files, agentSummary }) {
     super();
     if (!token || token.length < 16) throw new Error('orchestrator token missing or too short');
     this.root = root;
     this.cfg = remoteCfg;
     this.token = token;
     this.log = logger;
+    this.files = files ?? { ...DEFAULT_FILES };
+    this.agentSummary = agentSummary ?? {};
     /** @type {WorkerInfo|null} */
     this.worker = null;
     /** @type {Pending|null} */
@@ -188,7 +193,10 @@ export class OrchestratorServer extends EventEmitter {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html) });
         res.end(html);
       } else if (req.url === '/dashboard/data') {
-        this.respond(res, 200, dashboardData(this.root));
+        this.respond(res, 200, dashboardData(this.root, this.files, {
+          agents: this.agentSummary,
+          port: /** @type {import('node:net').AddressInfo|null} */ (this.server?.address() ?? null)?.port ?? null,
+        }));
       } else {
         this.respond(res, 404, { error: 'unknown endpoint' });
       }

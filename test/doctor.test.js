@@ -12,13 +12,16 @@ function find(checks, label) {
   return c;
 }
 
+/** Pin the protocol paths so these tests do not depend on the defaults. */
+const FILES = { task: 'tasks/current.md', coderReport: 'reports/current.md', testSpec: 'test/current.md', testReport: 'test/report.md' };
+
 test('doctor flags a protocol file configured in the wrong directory', async () => {
   const root = makeRoot();
   try {
     // The real-world trap: the repo uses tests/, the config says test/.
     write(root, 'tests/report.md', 'Task-ID: P6-06\nResult: PASS\n');
     write(root, 'tasks/current.md', 'Task-ID: P6-06\n');
-    const cfg = mergeConfig(root, {});
+    const cfg = mergeConfig(root, { files: FILES });
     const { checks, ok } = await doctor(root, cfg, { logger: createLogger(root, { quiet: true }) });
     const c = find(checks, 'protocol file (testReport)');
     assert.equal(c.ok, false);
@@ -37,7 +40,7 @@ test('doctor is satisfied when the configured paths match reality', async () => 
     write(root, 'reports/current.md', 'Task-ID: T-1\nStatus: COMPLETE\n');
     write(root, 'test/current.md', 'Task-ID: T-1\n');
     write(root, 'test/report.md', 'Task-ID: T-1\nResult: PASS\n');
-    const cfg = mergeConfig(root, {});
+    const cfg = mergeConfig(root, { files: FILES });
     const { checks } = await doctor(root, cfg, { logger: createLogger(root, { quiet: true }) });
     for (const key of ['task', 'coderReport', 'testSpec', 'testReport']) {
       assert.equal(find(checks, `protocol file (${key})`).ok, true, key);
@@ -50,14 +53,14 @@ test('doctor is satisfied when the configured paths match reality', async () => 
 test('doctor reports missing agent commands and git state', async () => {
   const root = makeRoot();
   try {
-    const cfg = mergeConfig(root, { coderCommand: 'definitely-not-a-real-command-xyz' });
+    const cfg = mergeConfig(root, { coderCommand: 'definitely-not-a-real-command-xyz', files: FILES });
     const { checks, ok } = await doctor(root, cfg, { logger: createLogger(root, { quiet: true }) });
     assert.equal(find(checks, 'coder command').ok, false);
     assert.equal(find(checks, 'git repository').ok, false); // makeRoot() is not a repo
     assert.equal(ok, false);
 
     gitRun(root, ['init', '-q', '-b', 'main']);
-    const { checks: after } = await doctor(root, mergeConfig(root, {}), { logger: createLogger(root, { quiet: true }) });
+    const { checks: after } = await doctor(root, mergeConfig(root, { files: FILES }), { logger: createLogger(root, { quiet: true }) });
     assert.equal(find(after, 'git repository').ok, true);
     assert.equal(find(after, 'git remote / upstream').ok, null); // warn: no remote yet
   } finally {

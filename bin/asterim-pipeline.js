@@ -239,7 +239,16 @@ async function orchestratorCmd(args) {
   }
   ensurePipelineGitignore(root);
   const token = ensureOrchestratorToken(root);
-  const server = new OrchestratorServer({ root, remoteCfg: config.remote, token, logger });
+  const server = new OrchestratorServer({
+    root,
+    remoteCfg: config.remote,
+    token,
+    logger,
+    files: config.files,
+    agentSummary: Object.fromEntries(
+      Object.entries(config.agents).map(([role, a]) => [role, [a.command, ...a.args].join(' ')]),
+    ),
+  });
   const port = await server.listen();
   console.log(`dashboard: http://127.0.0.1:${port}/dashboard`);
   const remote = new RemoteExecutor(server, { root, cfg: config, logger });

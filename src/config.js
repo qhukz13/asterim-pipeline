@@ -41,8 +41,8 @@ export const DEFAULT_PROMPTS = {
 export const DEFAULT_FILES = {
   task: 'tasks/current.md',
   coderReport: 'reports/current.md',
-  testSpec: 'test/current.md',
-  testReport: 'test/report.md',
+  testSpec: 'tests/current.md',
+  testReport: 'tests/report.md',
 };
 
 /**

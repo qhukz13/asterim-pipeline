@@ -125,6 +125,17 @@ export function normalOrchestrator(root, opts = {}) {
 }
 
 /**
+ * Protocol paths the fixtures write. Pinned so the suite is independent of
+ * whatever `files` default a project happens to be configured with.
+ */
+export const TEST_FILES = {
+  task: 'tasks/current.md',
+  coderReport: 'reports/current.md',
+  testSpec: 'test/current.md',
+  testReport: 'test/report.md',
+};
+
+/**
  * Build a test config wired to fake agent scripts, git disabled by default.
  * @param {string} root
  * @param {{coder?: string, tester?: string, orchestrator?: string, raw?: Record<string, any>}} agents
@@ -137,6 +148,7 @@ export function testConfig(root, agents) {
   return mergeConfig(root, {
     watchDebounceMs: 150,
     git: { enabled: false },
+    files: { ...TEST_FILES },
     agents: {
       coder: scriptAgent(agents.coder),
       tester: scriptAgent(agents.tester),

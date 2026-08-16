@@ -17,7 +17,7 @@ import { RemoteExecutor } from '../src/remote.js';
 import { createLogger } from '../src/logger.js';
 import { mergeConfig } from '../src/config.js';
 import { readState, writeState, defaultState } from '../src/store.js';
-import { makeGitPair, gitRun, write, read, counter, waitFor, sleep, fakeAgent } from './helpers.js';
+import { makeGitPair, gitRun, write, read, counter, waitFor, sleep, fakeAgent, TEST_FILES } from './helpers.js';
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'asterim-pipeline.js');
 const TOKEN = 'integration-token-0123456789abcdef';
@@ -61,6 +61,7 @@ function workerTester(root) {
 /** Write the worker clone's local agent config. @param {string} root @param {string} coder @param {string} tester */
 function writeWorkerConfig(root, coder, tester) {
   write(root, '.pipeline/config.json', JSON.stringify({
+    files: { ...TEST_FILES }, // must match the orchestrator's paths
     agents: {
       coder: { command: process.execPath, args: [coder], timeoutMinutes: 1 },
       tester: { command: process.execPath, args: [tester], timeoutMinutes: 1 },
@@ -85,6 +86,7 @@ function orchestratorPieces(orchRoot, extraCfg = {}) {
   const config = mergeConfig(orchRoot, {
     git: { enabled: true },
     remote: REMOTE,
+    files: { ...TEST_FILES },
     agents: { orchestrator: { command: process.execPath, args: [fakeAgent(orchRoot, 'orch', `
       const n = bump('orch');
       fs.writeFileSync(path.join(root, '.orch-prompt-' + n), prompt);
