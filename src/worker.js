@@ -346,6 +346,21 @@ export class Worker {
         ? `did not create ${reportRel}`
         : `did not modify ${reportRel} (it still holds the previous content)`;
       this.log.warn(`[worker] [${role}] ${what}`);
+      // Distinguish "could not write anything" (permissions) from "worked,
+      // then ended its session early" — the fixes are completely different.
+      const protocolPaths = new Set(Object.values(this.files).map((p) => p.replace(/\\/g, '/')));
+      const dirty = gitx
+        .changedPaths(this.root)
+        .filter((p) => !p.startsWith('.pipeline/') && !protocolPaths.has(p));
+      const newCommit = preSha != null && gitx.headSha(this.root) !== preSha;
+      const cause = newCommit || dirty.length > 0
+        ? `The agent DID change files, so this is not a permissions problem — it ended its session before writing the report. ` +
+          `Headless runs get a single session: if the agent stops to report progress or hits a turn limit, the run ends there. ` +
+          (newCommit ? 'It made a commit. ' : '') +
+          (dirty.length > 0 ? `Uncommitted: ${dirty.slice(0, 6).join(', ')}${dirty.length > 6 ? ` (+${dirty.length - 6} more)` : ''}. ` : '') +
+          'Review that work on the worker before re-running, so it is not repeated or lost.'
+        : 'The agent changed nothing at all, which usually means it was denied permission to write files in headless mode. ' +
+          'Run "asterim-pipeline doctor --probe" on the worker to confirm.';
       const tail = this.tailOf(res.logFile);
       if (tail) {
         // Make the reason obvious on the worker's own terminal too.
@@ -355,8 +370,7 @@ export class Worker {
         dispatchId: cmd.dispatchId,
         message:
           `the ${role} exited (code ${res.code}) but ${what} in the worker clone at ${this.root}. ` +
-          'This usually means the agent was denied permission to write the file in headless mode. ' +
-          `Full agent output is on the worker at ${workerLog}.`,
+          `${cause} Full agent output is on the worker at ${workerLog}.`,
         outputTail: tail,
       }));
     }

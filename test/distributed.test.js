@@ -260,6 +260,45 @@ test('distributed: a denied write surfaces the agent output in the human gate', 
   }
 });
 
+test('distributed: an agent that works but ends early is not blamed on permissions', async () => {
+  const { orchRoot, workerRoot, cleanup } = makeGitPair();
+  /** @type {import('node:child_process').ChildProcess|null} */
+  let workerChild = null;
+  const { server, runner } = orchestratorPieces(orchRoot);
+  try {
+    // Edits a source file, then exits 0 with a progress narration and no
+    // report — the real P6-06-FIX failure mode.
+    const earlyExit = fakeAgent(
+      workerRoot,
+      'wearly',
+      `bump('coder');
+       fs.writeFileSync(path.join(root, 'BaseAdapter.ts'), 'const ttl = 1;\\n');
+       console.log('Reproduction battery is running (12 forced runs, ~12 min).');
+       process.exit(0);`,
+    );
+    writeWorkerConfig(workerRoot, earlyExit, workerTester(workerRoot));
+    const port = await server.listen();
+    const w = spawnWorker(workerRoot, port);
+    workerChild = w.child;
+    await waitFor(() => server.online(), 10000);
+
+    write(orchRoot, 'tasks/current.md', 'Task-ID: T-1\nPhase: 1\n');
+    write(orchRoot, 'test/current.md', 'Task-ID: T-1\nRun tests.\n');
+
+    const info = await runner.start({ once: true });
+    assert.equal(info.gated, true);
+    const reason = runner.st.gateReason ?? '';
+    assert.match(reason, /DID change files/);
+    assert.match(reason, /ended its session before writing the report/);
+    assert.match(reason, /BaseAdapter\.ts/);
+    assert.ok(!/denied permission/.test(reason), 'must not blame permissions when the agent clearly could write');
+  } finally {
+    workerChild?.kill();
+    server.close();
+    cleanup();
+  }
+});
+
 test('distributed: a successful run sends no agent output over the LAN', async () => {
   const { orchRoot, workerRoot, cleanup } = makeGitPair();
   /** @type {import('node:child_process').ChildProcess|null} */

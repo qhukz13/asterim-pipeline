@@ -12,6 +12,11 @@ export const DEFAULT_PROMPTS = {
   coder:
     'Read AGENTS.md, CLAUDE.md, and {taskFile}.\n' +
     'Execute the current task ({taskId}).\n' +
+    'You are running non-interactively and get exactly ONE session: there is no later turn, and nothing you leave ' +
+    'running in the background will be observed. Do not end your turn with a progress update — the only thing the ' +
+    'pipeline sees is the report file, so finish the work and write the report in this session.\n' +
+    'If you run out of room, cannot finish, or a verification step is still inconclusive, that is fine: write the ' +
+    'report anyway with "Status: BLOCKED" and describe exactly what remains. Never stop without writing it.\n' +
     'Before reporting completion, independently review the git diff against every acceptance criterion and fix any issues.\n' +
     'Run all required verification.\n' +
     'Write the final report to {coderReportFile} (that exact path). The report MUST begin with these two exact plain-text lines ' +
@@ -24,6 +29,8 @@ export const DEFAULT_PROMPTS = {
     'Read AGENTS.md, CLAUDE.md, {taskFile}, {coderReportFile}, and {testSpecFile}.\n' +
     'Execute ONLY the tests specified in {testSpecFile}.\n' +
     'Do not modify production code.\n' +
+    'You are running non-interactively and get exactly ONE session: finish and write the report in this session. ' +
+    'If verification could not be completed, still write the report with "Result: FAIL" and explain what was not run.\n' +
     'Write the complete verification result to {testReportFile} (that exact path). The report MUST begin with these two exact plain-text lines ' +
     '(no markdown bold, no emoji, no extra words on the line):\n' +
     'Task-ID: {taskId}\n' +

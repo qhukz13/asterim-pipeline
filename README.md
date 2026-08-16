@@ -225,6 +225,28 @@ to source, just the report file and the test commands) so the "tester must
 not modify production code" rule is enforced by permissions and not only by
 the prompt.
 
+## One session per run
+
+A headless agent gets exactly one session. When the model returns a text
+answer, the process exits — there is no later turn, and anything it left
+running in the background is never observed. The failure this produces looks
+like success: the agent edits files, narrates progress ("battery is running,
+~12 min…"), exits 0, and never writes its report or commits.
+
+The pipeline handles this safely — a report that was not written is never
+accepted — and the gate distinguishes the two causes:
+
+- *"The agent changed nothing at all"* → permissions; run `doctor --probe`.
+- *"The agent DID change files … ended its session before writing the
+  report"* → it stopped early. **Review the uncommitted work on the worker
+  before re-running**, so it is not lost or repeated.
+
+The default prompts tell agents they get one session and must write the
+report even when blocked. If tasks routinely outgrow a session, make them
+smaller — that is the orchestrator's job — or raise the agent's turn budget
+in `.pipeline/config.json`, e.g.
+`"args": ["-p", "--max-turns", "200"]`.
+
 ## Distributed mode (PC + laptop over LAN)
 
 Distributed mode splits the pipeline across two machines on the same local
