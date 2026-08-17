@@ -174,6 +174,147 @@ test('the orchestrator is launched in print mode with the prompt as -p\'s value'
   assert.ok(args.includes('--dangerously-skip-permissions'));
 });
 
+/** Run one full cycle and return the prompt the orchestrator received. */
+async function capturedOrchestratorPrompt(root, roadmap) {
+  seedTask(root, 'T-1');
+  const orch = fakeAgent(root, 'road-orch', `bump('orch');
+    fs.writeFileSync(path.join(root, '.orch-prompt'), prompt);
+    fs.writeFileSync(path.join(root, 'tasks', 'current.md'), 'Status: PHASE_COMPLETE\\nPhase: 1\\n');
+    process.exit(0);`);
+  const config = testConfig(root, { coder: normalCoder(root), tester: normalTester(root, 'PASS'), orchestrator: orch });
+  if (roadmap) {
+    write(root, roadmap, '# Plan\n\n## 3. Legacy\n## 4. Initiatives\n## 5. Phases 7-10\n');
+    config.files.roadmap = roadmap;
+  }
+  await new Runner({ root, config, logger: createLogger(root, { quiet: true }) }).start({ once: true });
+  return read(root, '.orch-prompt') ?? '';
+}
+
+test('no roadmap configured leaves the orchestrator prompt unchanged', async () => {
+  const root = makeRoot();
+  try {
+    const p = await capturedOrchestratorPrompt(root, null);
+    assert.ok(p !== '', 'the orchestrator should have run');
+    assert.ok(!p.includes('ROADMAP-DRIVEN PLANNING'));
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('a configured roadmap appends the planning discipline to the prompt', async () => {
+  const root = makeRoot();
+  try {
+    const p = await capturedOrchestratorPrompt(root, 'blueprint/ROADMAP.md');
+    assert.match(p, /ROADMAP-DRIVEN PLANNING/);
+    assert.match(p, /Read blueprint\/ROADMAP\.md before deciding anything/);
+    assert.match(p, /earliest section that is not yet finished/);
+    assert.match(p, /PR-sized tasks/);
+    assert.match(p, /Dispatch exactly ONE/);
+    assert.match(p, /SECTION BOUNDARIES/);
+    assert.ok(!p.includes('{roadmapFile}'), 'placeholder must be substituted');
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('resuming a phase gate asks the orchestrator to plan the next section', async () => {
+  const root = makeRoot();
+  try {
+    // State as it is right after a phase-complete gate: the task file holds
+    // PHASE_COMPLETE and there is nothing for the coder to do.
+    write(root, 'tasks/current.md', 'Status: PHASE_COMPLETE\nPhase: 6\n');
+    write(root, 'blueprint/ROADMAP.md', '# Plan\n## 3. Legacy\n');
+    const s = defaultState();
+    s.state = 'HUMAN_GATE';
+    s.gateReason = 'Phase 6 has completed.';
+    s.phase = '6';
+    writeState(root, s);
+
+    const planner = fakeAgent(root, 'planner', `const n = bump('orch');
+      fs.writeFileSync(path.join(root, '.plan-prompt'), prompt);
+      fs.writeFileSync(path.join(root, 'tasks', 'current.md'), 'Task-ID: P7-01\\nPhase: 7\\n\\nFirst PR of the next section.\\n');
+      process.exit(0);`);
+    const config = testConfig(root, { coder: normalCoder(root), tester: normalTester(root, 'PASS'), orchestrator: planner });
+    config.files.roadmap = 'blueprint/ROADMAP.md';
+    const r = new Runner({ root, config, logger: createLogger(root, { quiet: true }) });
+
+    const done = r.start();
+    await waitFor(() => r.st.state === 'HUMAN_GATE', 5000);
+    assert.equal(counter(root, 'orch'), 0, 'the gate must hold until the human resumes');
+
+    writeControl(root, 'resume');
+    await waitFor(() => r.st.taskId === 'P7-01', 15000);
+    assert.equal(counter(root, 'orch'), 1, 'resume should trigger exactly one planning run');
+    assert.match(read(root, '.plan-prompt') ?? '', /ROADMAP-DRIVEN PLANNING/);
+    assert.match(read(root, '.plan-prompt') ?? '', /reviewed and approved by the human/);
+
+    r.requestStop('test done');
+    await done;
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('re-declaring PHASE_COMPLETE while planning gates instead of looping', async () => {
+  const root = makeRoot();
+  try {
+    // The real failure: asked to plan the next unit, the orchestrator simply
+    // restated the marker the human had just cleared. Without a guard that
+    // bounces between gate and resume forever.
+    write(root, 'tasks/current.md', 'Status: PHASE_COMPLETE\nPhase: 10\n');
+    write(root, 'blueprint/ROADMAP.md', '# Plan\n## 3. Legacy\n');
+    const s = defaultState();
+    s.state = 'HUMAN_GATE';
+    s.gateReason = 'Phase 10 has completed.';
+    writeState(root, s);
+
+    const stubborn = fakeAgent(root, 'stubborn-orch', `bump('orch');
+      fs.writeFileSync(path.join(root, 'tasks', 'current.md'), 'Status: PHASE_COMPLETE\\nPhase: 10\\n\\nStill done.\\n');
+      process.exit(0);`);
+    const config = testConfig(root, { orchestrator: stubborn });
+    config.files.roadmap = 'blueprint/ROADMAP.md';
+    const r = new Runner({ root, config, logger: createLogger(root, { quiet: true }) });
+
+    const done = r.start();
+    await waitFor(() => r.st.state === 'HUMAN_GATE', 5000);
+    writeControl(root, 'resume');
+    await waitFor(() => /instead of planning the next unit/.test(r.st.gateReason ?? ''), 15000);
+    assert.equal(counter(root, 'orch'), 1, 'must not retry in a loop');
+
+    r.requestStop('test done');
+    await done;
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
+test('planNextOnResume=false keeps the old hand-written-task behaviour', async () => {
+  const root = makeRoot();
+  try {
+    write(root, 'tasks/current.md', 'Status: PHASE_COMPLETE\nPhase: 6\n');
+    const s = defaultState();
+    s.state = 'HUMAN_GATE';
+    s.gateReason = 'Phase 6 has completed.';
+    writeState(root, s);
+
+    const orch = fakeAgent(root, 'never-orch', `bump('orch'); process.exit(0);`);
+    const config = testConfig(root, { orchestrator: orch });
+    config.planNextOnResume = false;
+    const r = new Runner({ root, config, logger: createLogger(root, { quiet: true }) });
+
+    const done = r.start();
+    await waitFor(() => r.st.state === 'HUMAN_GATE', 5000);
+    writeControl(root, 'resume');
+    await sleep(1200);
+    assert.equal(counter(root, 'orch'), 0, 'must wait for a hand-written task instead');
+    assert.equal(r.st.state, 'IDLE');
+    r.requestStop('test done');
+    await done;
+  } finally {
+    cleanupRoot(root);
+  }
+});
+
 test('default prompts contain no hardcoded protocol paths', () => {
   for (const [role, text] of Object.entries(DEFAULT_PROMPTS)) {
     const hardcoded = text.match(/\b(?:tasks?|reports?|tests?)\/[\w-]+\.md\b/g);

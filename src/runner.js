@@ -57,6 +57,8 @@ export class Runner extends EventEmitter {
     this.remote = remote;
     /** Shared dashboard output feed, when a dashboard is being served. */
     this.bus = bus;
+    /** Set after a resumed gate: ask the orchestrator for the next step. */
+    this.planRequested = false;
     this.waitingForWorkerLogged = false;
     /** @type {import('./store.js').PersistedState} */
     this.st = readState(root).state;
@@ -107,8 +109,18 @@ export class Runner extends EventEmitter {
       coderReportFile: this.cfg.files.coderReport,
       testSpecFile: this.cfg.files.testSpec,
       testReportFile: this.cfg.files.testReport,
+      roadmapFile: this.cfg.files.roadmap,
       ...extra,
     };
+  }
+
+  /**
+   * The orchestrator prompt, plus the roadmap planning discipline when a
+   * roadmap is configured.
+   */
+  orchestratorPrompt() {
+    const base = this.cfg.prompts.orchestrator;
+    return this.cfg.files.roadmap ? `${base}\n${this.cfg.prompts.orchestratorRoadmap}` : base;
   }
 
   /**
@@ -424,6 +436,10 @@ export class Runner extends EventEmitter {
       if (this.resumeRequested) {
         this.resumeRequested = false;
         this.log.info('human resume received; re-evaluating protocol files');
+        // A resumed gate is the human saying "carry on", so let the
+        // orchestrator plan the next step rather than idling for a
+        // hand-written task file.
+        this.planRequested = this.cfg.planNextOnResume;
         s.gateReason = null;
         this.rescan(true);
         return false;
@@ -479,6 +495,17 @@ export class Runner extends EventEmitter {
             this.setState('TASK_READY');
           }
           return false;
+        }
+        if (this.planRequested) {
+          this.planRequested = false;
+          if (s.paused) return this.runOnce ? true : (await this.waitForWake(), false);
+          this.log.info('planning the next step from the roadmap');
+          await this.orchestratorStep(
+            `the phase-complete marker already in ${this.cfg.files.task} HAS ALREADY been reviewed and approved by ` +
+              'the human, so do NOT re-declare it — replace that file with the FIRST task of the next unit of work',
+            true,
+          );
+          return this.afterOrchestrationOnce();
         }
         if (this.runOnce) {
           this.exitInfo = { ok: true, gated: false, message: 'no new task; nothing to do' };
@@ -856,12 +883,14 @@ export class Runner extends EventEmitter {
 
   /**
    * @param {string} trigger short human-readable reason shown to the orchestrator
+   * @param {boolean} [planning] true when invoked to plan the next unit after
+   *   a resumed gate, where re-declaring phase completion is not progress
    */
-  async orchestratorStep(trigger) {
+  async orchestratorStep(trigger, planning = false) {
     const s = this.st;
     const before = this.readProto('task');
     this.setState('ORCHESTRATING');
-    const prompt = renderPrompt(this.cfg.prompts.orchestrator, this.promptVars({ trigger: ` — note: ${trigger}` }));
+    const prompt = renderPrompt(this.orchestratorPrompt(), this.promptVars({ trigger: ` — note: ${trigger}` }));
     const res = await this.launch('orchestrator', prompt);
     if (this.agentAborted('orchestrator', res)) return;
 
@@ -880,6 +909,17 @@ export class Runner extends EventEmitter {
       return;
     }
     if (task.phaseComplete) {
+      if (planning) {
+        // It was asked for the next unit and repeated the marker the human
+        // just cleared. Gating beats bouncing between gate and resume.
+        this.gate('Orchestrator re-declared the phase complete instead of planning the next unit of work.', [
+          'That gate was already reviewed and resumed, so this is not progress.',
+          `Write the first task of the next unit to ${this.cfg.files.task} yourself, or adjust the roadmap ` +
+            'so the next unit is unambiguous, then resume.',
+          ...agentOutputDetail(res),
+        ]);
+        return;
+      }
       this.phaseCompleteGate(task);
       return;
     }

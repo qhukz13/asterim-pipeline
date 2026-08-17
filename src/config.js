@@ -63,6 +63,30 @@ export const DEFAULT_PROMPTS = {
     '(that exact path) with a matching "Task-ID: <id>" line.\n' +
     'Do not create or write any other task/report path variant.\n' +
     'If the current phase is complete, instead write "Status: PHASE_COMPLETE" to {taskFile}.',
+
+  // Appended to the orchestrator prompt only when files.roadmap is configured.
+  orchestratorRoadmap:
+    '\nROADMAP-DRIVEN PLANNING\n' +
+    'Read {roadmapFile} before deciding anything. It is the authoritative plan; {taskFile} is only ever ' +
+    'ONE small step out of it.\n' +
+    'Work the roadmap in the order it presents its sections, always continuing the earliest section that is not ' +
+    'yet finished, and finishing it before starting the next. Do not skip ahead, and do not interleave sections.\n' +
+    'Break the current section into PR-sized tasks: one coherent change a reviewer could read in a sitting, ' +
+    'independently verifiable, and leaving the tree in a working state. A section is normally several such tasks. ' +
+    'Dispatch exactly ONE of them — the next one — per turn.\n' +
+    'Decide per task whether it needs verification: write {testSpecFile} when the tester must run something, and ' +
+    'omit it when the change genuinely cannot be tested (docs, config), saying so in the task itself.\n' +
+    '\n' +
+    'SECTION BOUNDARIES — when the current section looks finished, do NOT move on yet. First verify it:\n' +
+    '  - re-read that section\'s goals and acceptance criteria in {roadmapFile};\n' +
+    '  - check the completed reports and the git history actually satisfy every one of them;\n' +
+    '  - confirm nothing was silently dropped, stubbed, or deferred along the way.\n' +
+    'If anything is missing, the next task is to finish it — the section is not done. Only when the section is ' +
+    'genuinely complete, write "Status: PHASE_COMPLETE" to {taskFile} together with a short summary of what the ' +
+    'section delivered and how you verified it, so the human can review the boundary.\n' +
+    'After the human resumes you will be asked to plan again. If {taskFile} still holds a "PHASE_COMPLETE" marker ' +
+    'at that point, it has already been reviewed and approved — do NOT restate it. Read {roadmapFile} afresh, pick ' +
+    'up the next unfinished section, and replace {taskFile} with the first task of that section.',
 };
 
 /** Protocol file locations, relative to project root. */
@@ -71,6 +95,10 @@ export const DEFAULT_FILES = {
   coderReport: 'reports/current.md',
   testSpec: 'tests/current.md',
   testReport: 'tests/report.md',
+  // Optional: the long-range plan the orchestrator breaks into tasks. When
+  // set, the roadmap addendum is appended to the orchestrator prompt and the
+  // pipeline asks it to plan the next section after a phase gate is resumed.
+  roadmap: '',
 };
 
 /**
@@ -90,8 +118,9 @@ export const DEFAULT_FILES = {
  *            allowPublicClients: boolean, autoCommitTaskFiles: boolean,
  *            includeFailureOutput: boolean, failureOutputChars: number,
  *            streamAgentOutputToOrchestrator: boolean, outputFlushMs: number, outputBufferLines: number},
- *   prompts: {coder: string, tester: string, orchestrator: string},
- *   files: {task: string, coderReport: string, testSpec: string, testReport: string},
+ *   planNextOnResume: boolean,
+ *   prompts: {coder: string, tester: string, orchestrator: string, orchestratorRoadmap: string},
+ *   files: {task: string, coderReport: string, testSpec: string, testReport: string, roadmap: string},
  * }} Config
  */
 
@@ -123,6 +152,10 @@ export function defaultConfig(projectRoot) {
     // Mirror locally-run agent output into the pipeline terminal (it is
     // always captured to .pipeline/logs/ regardless).
     streamAgentOutput: true,
+    // After a human resumes a phase-complete gate the pipeline would other-
+    // wise sit idle waiting for someone to write the next task by hand. With
+    // this on, it asks the orchestrator to plan the next roadmap section.
+    planNextOnResume: true,
     agents: {
       coder: agentDefaults('claude'),
       tester: agentDefaults('claude'),
@@ -189,7 +222,9 @@ export function mergeConfig(projectRoot, raw) {
   for (const key of /** @type {const} */ (['watchDebounceMs', 'maxConsecutiveTestFailures', 'maxConsecutiveBlocked'])) {
     if (typeof raw[key] === 'number' && raw[key] >= 0) cfg[key] = raw[key];
   }
-  for (const key of /** @type {const} */ (['humanGateOnPhaseComplete', 'skipTestingIfNoTestSpec', 'streamAgentOutput'])) {
+  for (const key of /** @type {const} */ ([
+    'humanGateOnPhaseComplete', 'skipTestingIfNoTestSpec', 'streamAgentOutput', 'planNextOnResume',
+  ])) {
     if (typeof raw[key] === 'boolean') cfg[key] = raw[key];
   }
   for (const role of /** @type {const} */ (['coder', 'tester', 'orchestrator'])) {
@@ -206,6 +241,7 @@ export function mergeConfig(projectRoot, raw) {
     }
     if (typeof raw.prompts?.[role] === 'string') cfg.prompts[role] = raw.prompts[role];
   }
+  if (typeof raw.prompts?.orchestratorRoadmap === 'string') cfg.prompts.orchestratorRoadmap = raw.prompts.orchestratorRoadmap;
   if (raw.git && typeof raw.git === 'object') {
     for (const key of /** @type {const} */ (['enabled', 'validateCoderCommit', 'pullBeforeCycle', 'pushAfterCommit'])) {
       if (typeof raw.git[key] === 'boolean') cfg.git[key] = raw.git[key];
@@ -229,6 +265,8 @@ export function mergeConfig(projectRoot, raw) {
     for (const key of /** @type {const} */ (['task', 'coderReport', 'testSpec', 'testReport'])) {
       if (typeof raw.files[key] === 'string' && raw.files[key].trim() !== '') cfg.files[key] = raw.files[key];
     }
+    // roadmap is optional, so an empty string is a meaningful value here.
+    if (typeof raw.files.roadmap === 'string') cfg.files.roadmap = raw.files.roadmap.trim();
   }
   return cfg;
 }

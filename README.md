@@ -210,6 +210,18 @@ Trim the list to what your project actually needs. If a run still stalls,
 the agent log (`.pipeline/logs/coder-*.log`) names the exact tool call that
 was denied — add that one and re-run.
 
+**Antigravity may ignore the working directory.** `agy` resolves its
+workspace from its own project/conversation state, not from the directory it
+was launched in: in testing it was started in a scratch repo and wrote
+`tasks/current.md` into a different project entirely. Consequences:
+
+- Run the orchestrator only against the project `agy` is actually bound to.
+- Never point a *test* or scratch root at the real `agy` — use a fixture
+  agent instead (the test suite refuses real binaries for this reason).
+- The pipeline degrades safely if this happens: it verifies the task file it
+  watches actually changed, so writes elsewhere produce a human gate rather
+  than a silently wrong dispatch.
+
 **The orchestrator has its own permission system.** Antigravity is a
 different program with its own settings; granting Claude permissions does
 nothing for it. If `agy` exits without writing the task file and complains

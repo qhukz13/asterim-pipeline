@@ -22,7 +22,9 @@ export const STATES = /** @type {const} */ ([
  * @type {Record<PipelineState, PipelineState[]>}
  */
 export const TRANSITIONS = {
-  IDLE: ['TASK_READY', 'HUMAN_GATE', 'FAILED'],
+  // IDLE -> ORCHESTRATING: after a resumed phase gate the orchestrator is
+  // asked to plan the next section rather than waiting for a hand-written task.
+  IDLE: ['TASK_READY', 'ORCHESTRATING', 'HUMAN_GATE', 'FAILED'],
   TASK_READY: ['CODING', 'HUMAN_GATE', 'FAILED'],
   CODING: ['CODE_REPORT_READY', 'BLOCKED', 'HUMAN_GATE', 'FAILED'],
   CODE_REPORT_READY: ['TESTING', 'ORCHESTRATING', 'HUMAN_GATE', 'FAILED'],
